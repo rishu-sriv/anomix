@@ -49,23 +49,79 @@ Transaction (transactions)               — buy/sell/dividend events
 
 ---
 
-## Where things live
+## File map
+
+Use this as the first reference before exploring. Every directory and key file is listed here.
 
 ```
-database/models/            — SQLModel table definitions
-database/migrations.py      — column/index migrations (run on startup per tenant)
-src/store/                  — all DB operations; PulseIqStore aggregates them all
-src/api/routes/             — one file per domain; registered in src/api/app.py
-src/api/middleware/auth.py  — tenant-aware authentication for incoming requests
-config/settings.py          — app-level env config (not tenant-specific)
-src/utils/tenant_config.py  — tenant config loader (file or Vault)
-src/agents/                 — LangGraph agents
-src/agents/prompts/         — all system prompts as .txt files (never inline in code)
-src/tools/                  — LangChain @tool definitions by domain
-src/services/               — business logic (artifact, alert, email, Slack, etc.)
-src/constants/              — enums, prompt maps, config constants
-src/cache/                  — Redis + external data caching layers
-src/guardrails/             — input validation and safety checks
+FinPulse/
+├── config/
+│   └── settings.py                      — app-level env vars (Pydantic BaseSettings); not tenant-specific
+│
+├── database/
+│   ├── models/                          — SQLModel table definitions; one file per entity
+│   │   └── <entity>.py
+│   ├── migration_helpers.py             — idempotent helpers: add_column, create_index, drop_table, execute_sql, etc.
+│   └── migrations.py                    — run_migrations_for_tenant() called on startup per tenant
+│
+├── src/
+│   ├── api/
+│   │   ├── app.py                       — FastAPI app init; all routers registered here
+│   │   ├── middleware/
+│   │   │   └── auth.py                  — tenant auth; sets tenant_id in contextvars, cleared after response
+│   │   └── routes/                      — one file per domain: <entity>_routes.py
+│   │
+│   ├── agents/
+│   │   ├── factory.py                   — AGENT_IDS list, _PIPELINE_AGENTS set, agent instantiation logic
+│   │   ├── <agent_id>.py                — LangGraph graph: orchestrator → batch → workers → synthesizer
+│   │   └── prompts/
+│   │       ├── <agent_id>.txt           — top-level agent system prompt
+│   │       ├── orchestration/           — orchestrator routing instructions per agent
+│   │       │   └── orchestrator_<agent_id>.txt
+│   │       ├── workers/                 — per-worker system prompts
+│   │       │   └── <worker_id>.txt
+│   │       └── tasks/                   — one-off task prompts (LLM-generated summaries, grading, etc.)
+│   │           └── <name>.txt
+│   │
+│   ├── cache/                           — Redis caching layers (context: 12h TTL, tools: 30m, history: 10m)
+│   ├── constants/                       — enums, signal status values, prompt maps, config constants
+│   ├── guardrails/                      — input validation and safety checks before agent execution
+│   ├── services/                        — business logic not in stores: artifact, alert, email, Slack
+│   │
+│   ├── store/
+│   │   ├── base_store.py                — BaseStore with get_session() context manager
+│   │   ├── pulseiq_store.py             — PulseIqStore: aggregates all domain stores; instantiated per request
+│   │   ├── __init__.py                  — exports all stores
+│   │   └── <entity>_store.py           — one per entity; never filter by tenant_id (isolated at DB level)
+│   │
+│   ├── tools/                           — LangChain @tool definitions; one file per domain
+│   │   ├── portfolio_tools.py
+│   │   ├── risk_tools.py
+│   │   ├── market_data_tools.py
+│   │   ├── macro_tools.py
+│   │   ├── signal_tools.py
+│   │   ├── alert_tools.py
+│   │   ├── artifact_tool.py
+│   │   └── flexible_query_tools.py
+│   │
+│   └── utils/
+│       ├── context.py                   — get_tenant_id() / set_tenant_id() via contextvars
+│       └── tenant_config.py             — tenant config loader (tenantConfig.yml locally, Vault in prod)
+│
+├── tenantConfig.yml                     — tenant configs (local dev); use Vault secret refs in prod
+│
+└── .claude/
+    └── commands/                        — Claude Code slash commands
+        ├── agents/
+        │   └── scaffold.md              — /agents:scaffold   scaffold a new LangGraph agent + prompts
+        ├── entities/
+        │   └── scaffold.md              — /entities:scaffold scaffold a new CRUD entity (model+store+route+migration)
+        ├── tools/
+        │   └── scaffold.md              — /tools:scaffold    add a new @tool to a domain tools file
+        ├── tenants/
+        │   └── onboard.md               — /tenants:onboard   add tenant config + init tenant DB
+        └── review/
+            └── standards.md             — /review:standards  audit changes against coding standards
 ```
 
 ---
