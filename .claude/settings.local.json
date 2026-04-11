@@ -1,0 +1,9 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(wc -l /Users/rishu/Downloads/niti/niti-agents/src/agents/orchestration/nodes/*.py)",
+      "Bash(git init:*)",
+      "Bash(git remote:*)"
+    ]
+  }
+}
