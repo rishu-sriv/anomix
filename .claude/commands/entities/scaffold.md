@@ -1,4 +1,4 @@
-# /entity
+# /entities:scaffold
 
 Scaffold a new CRUD entity for FinPulse following the project conventions.
 

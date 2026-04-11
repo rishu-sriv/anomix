@@ -1,4 +1,4 @@
-# /tenant
+# /tenants:onboard
 
 Onboard a new tenant to FinPulse.
 

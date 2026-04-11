@@ -1,4 +1,4 @@
-# /agent
+# /agents:scaffold
 
 Scaffold a new LangGraph agent for FinPulse.
 

@@ -1,4 +1,4 @@
-# /tool
+# /tools:scaffold
 
 Add a new LangChain tool to the appropriate domain tools file.
 

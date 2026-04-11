@@ -1,4 +1,4 @@
-# /review
+# /review:standards
 
 Review the current set of changes against FinPulse coding standards.
 
