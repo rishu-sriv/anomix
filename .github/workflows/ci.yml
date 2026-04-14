@@ -1,0 +1,110 @@
+name: CI
+
+on:
+  push:
+    branches: ["*"]
+  pull_request:
+    branches: ["main"]
+
+jobs:
+
+  # ─── Python linting ──────────────────────────────────────────
+  ruff:
+    name: Python lint (ruff)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install ruff
+        run: pip install ruff==0.4.4
+      - name: Run ruff
+        run: ruff check backend/
+
+  # ─── Python type checking ────────────────────────────────────
+  mypy:
+    name: Python types (mypy)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install dependencies
+        run: pip install -r backend/requirements.txt
+      - name: Run mypy
+        run: mypy backend/app backend/workers --ignore-missing-imports
+
+  # ─── Python tests ────────────────────────────────────────────
+  pytest:
+    name: Python tests (pytest)
+    runs-on: ubuntu-latest
+    services:
+      timescaledb:
+        image: timescale/timescaledb:latest-pg16
+        env:
+          POSTGRES_DB: finpulse_test
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: testpassword
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    env:
+      DB_HOST: localhost
+      DB_PORT: 5432
+      DB_NAME: finpulse_test
+      DB_USER: postgres
+      DB_PASSWORD: testpassword
+      REDIS_URL: redis://localhost:6379/0
+      ANTHROPIC_API_KEY: sk-ant-fake-key-for-ci
+      LANGFUSE_PUBLIC_KEY: pk-lf-fake
+      LANGFUSE_SECRET_KEY: sk-lf-fake
+      LANGFUSE_HOST: https://cloud.langfuse.com
+      TICKERS: TSLA,AAPL
+      USE_MOCK_REPORTS: "true"
+      ANOMALY_ZSCORE_THRESHOLD: "2.5"
+      BACKEND_URL: http://localhost:8000
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+          cache-dependency-path: backend/requirements.txt
+      - name: Install dependencies
+        run: pip install -r backend/requirements.txt
+      - name: Run pytest
+        working-directory: backend
+        run: pytest tests/ -v --tb=short
+
+  # ─── Frontend type check ─────────────────────────────────────
+  typescript:
+    name: Frontend types (tsc)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "npm"
+          cache-dependency-path: frontend/package-lock.json
+      - name: Install dependencies
+        working-directory: frontend
+        run: npm install
+      - name: Type check
+        working-directory: frontend
+        run: npx tsc --noEmit
