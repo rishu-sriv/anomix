@@ -21,7 +21,6 @@ from sqlalchemy.ext.asyncio import (
     create_async_engine,
 )
 
-from app.config import settings
 from app.models import Base
 
 TEST_DB_NAME = "finpulse_test"
@@ -40,6 +39,8 @@ def event_loop():
 
 @pytest_asyncio.fixture(scope="session")
 async def test_engine():
+    from app.config import settings  # deferred so env vars are resolved at fixture time
+
     # Build URLs — swap the DB name in/out
     base_url = settings.async_database_url
     admin_url = base_url.rsplit("/", 1)[0] + "/postgres"

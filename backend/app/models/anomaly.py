@@ -49,9 +49,12 @@ class Anomaly(Base):
         SAEnum(Severity, name="severity", create_type=True), nullable=False
     )
     zscore: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
-    iqr_flag: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    iqr_flag: Mapped[bool] = mapped_column(
+        Boolean, default=False, server_default="false", nullable=False
+    )
     report_status: Mapped[ReportStatus] = mapped_column(
         SAEnum(ReportStatus, name="reportstatus", create_type=True),
         default=ReportStatus.pending,
+        server_default="pending",
         nullable=False,
     )
