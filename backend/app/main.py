@@ -1,18 +1,30 @@
+"""
+FastAPI application factory.
+
+Lifespan:
+  startup  — warm up the DB connection pool
+  shutdown — dispose the DB engine (closes all pooled connections)
+"""
+
+from contextlib import asynccontextmanager
+from collections.abc import AsyncGenerator
+
 from fastapi import FastAPI
 
-app = FastAPI(title="FinPulse API", version="0.1.0")
+from app.api.v1.router import router as v1_router
+from app.core.database import engine
 
 
-@app.get("/api/v1/health")
-async def health() -> dict:
-    """
-    Health check endpoint.
-    Phase 0: returns static response.
-    Phase 4: will check real DB and Redis connections.
-    """
-    return {
-        "status": "healthy",
-        "db": "not_checked",
-        "redis": "not_checked",
-        "note": "Phase 0 stub — real health check implemented in Phase 4",
-    }
+@asynccontextmanager
+async def lifespan(application: FastAPI) -> AsyncGenerator[None, None]:
+    # Startup: verify at least one connection can be established
+    async with engine.connect():
+        pass
+    yield
+    # Shutdown: release all pooled connections
+    await engine.dispose()
+
+
+app = FastAPI(title="FinPulse API", version="1.0.0", lifespan=lifespan)
+
+app.include_router(v1_router)
