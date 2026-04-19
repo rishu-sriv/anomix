@@ -6,6 +6,33 @@
 
 ---
 
+## V1 vs V2 — Feature Scope Reference
+
+> Use this table before touching any phase. If a feature is listed as V2, do not
+> implement it. Building V2 features during V1 scope creates code that conflicts with the
+> simplified pipeline and costs time you don't have.
+
+| Feature | V1 (current) | V2 (deferred) |
+|---|---|---|
+| **Tickers** | TSLA only — hardcoded | Multi-ticker via `TICKERS` env var |
+| **Detection method** | Z-score only | Z-score + IQR (two-signal confirmation) |
+| **Severity logic** | zscore > 3.5 = HIGH, ≥ 2.5 = MEDIUM, below 2.5 = no anomaly | Combined matrix using both zscore and IQR flag |
+| **Report generation** | Hardcoded mock written to DB synchronously (`USE_MOCK_REPORTS=true`) | Real Claude API call with Langfuse tracing |
+| **Report display** | REST `GET /api/v1/reports/{id}` — static completed text | SSE streaming, token-by-token as Claude generates |
+| **Frontend updates** | TanStack Query `refetchInterval: 30000` (REST polling) | WebSocket push from Redis Pub/Sub |
+| **TradingView chart** | Not included | Candlestick chart with anomaly markers |
+| **Toast notifications** | Not included | Sonner toast on HIGH severity WebSocket events |
+| **LiveIndicator** | Not included | Pulsing dot showing WebSocket connection state |
+| **MCP server** | Skipped entirely (Phase 7) | Claude Desktop integration with 3 tools |
+| **Langfuse tracing** | Not included (Phase 3 skipped) | Full trace per Claude call |
+
+**How to read this:** V1 is a working, deployable product. Every V1 feature above is
+fully implemented and tested. V2 features are not stubs — they simply do not exist yet.
+When moving to V2, implement each feature from scratch following the phase tasks marked
+SKIPPED IN V1.
+
+---
+
 ## How to use this document
 
 Each phase has tasks. Each task has:
@@ -529,8 +556,15 @@ a valid `.env` file prints the tickers list. Running without `.env` raises a cle
 
 ## Phase 2 — Ingestion + Detection Workers
 **Time estimate: 8–10 hours**
-**Goal: Data flows from yfinance into TimescaleDB. Anomalies are detected and written to
-DB. The full detection pipeline works end-to-end without the API.**
+**Goal: TSLA data flows from yfinance into TimescaleDB. Anomalies are detected using
+Z-score only and written to DB. Mock reports are written to DB synchronously. The full
+detection pipeline works end-to-end without the API.**
+
+> V1 simplifications applied to this phase:
+> - Ingestion fetches TSLA only — no multi-ticker batch logic
+> - Detector implements Z-score only — all IQR functions removed
+> - Severity: zscore > 3.5 = HIGH, zscore ≥ 2.5 = MEDIUM, below 2.5 = no anomaly
+> - Report task writes a hardcoded mock report to DB immediately — no Claude call
 
 ---
 
@@ -571,21 +605,24 @@ Celery connects to Redis successfully. Log shows "Connected to redis://..."
 
 ### Task 2.2 — Write the ingestion task
 
-**What you're doing:** The task that fires every 60 seconds. Fetches data from yfinance
-for all configured tickers in a single batch call, parses the MultiIndex DataFrame
-correctly, filters to new candles only, and upserts into TimescaleDB.
+**What you're doing:** The task that fires every 60 seconds. Fetches TSLA data from
+yfinance, parses the DataFrame, filters to new candles only, and upserts into TimescaleDB.
+
+**V1 constraint:** TSLA is hardcoded. There is no multi-ticker batch call, no MultiIndex
+DataFrame parsing, and no per-ticker Redis tracking for multiple tickers. One ticker, one
+call, one chain.
 
 **`workers/ingestion_task.py`:**
 
 Key implementation details:
-- Single `yf.download()` call for ALL tickers at once — not one call per ticker
-- MultiIndex parsing: columns are `(field, ticker)` — access as `df["Close"]["TSLA"]`
-- Track last ingestion time per ticker in Redis to filter out already-seen candles
+- Single `yf.download("TSLA", ...)` call — no `Tickers` object, no MultiIndex
+- Columns are flat: `df["Close"]`, `df["Volume"]`, etc. — access directly
+- Track last ingestion time for TSLA in Redis to filter out already-seen candles
 - Drop rows where volume is NaN (yfinance returns NaN for incomplete candles)
-- Drop rows where OHLC are all identical (these are stale/duplicated rows yfinance sometimes returns)
+- Drop rows where OHLC are all identical (stale/duplicated rows yfinance sometimes returns)
 - Upsert with `ON CONFLICT (time, ticker) DO NOTHING` — never plain INSERT
 - Market hours guard: skip task entirely outside 9:30am–4:00pm ET Monday–Friday
-- After successful upsert: chain `detect_anomalies.si(ticker)` for each ticker with new data
+- After successful upsert: chain `detect_anomalies.si("TSLA")`
 
 **Market hours guard:**
 ```python
@@ -615,23 +652,23 @@ def ingest_market_data(self):
 
 **Done when:** Trigger the task manually with `celery -A workers.celery_app call
 workers.ingestion_task.ingest_market_data`. Check the DB: `SELECT COUNT(*) FROM
-market_data`. Rows should be present. Running it a second time should not increase the
-count (idempotency check).
+market_data WHERE ticker = 'TSLA'`. Rows should be present. Running it a second time
+should not increase the count (idempotency check).
 
 ---
 
-### Task 2.3 — Write the detector service (pure functions)
+### Task 2.3 — Write the detector service (pure functions, Z-score only)
 
 **What you're doing:** The core anomaly detection logic. Pure functions — no database
-calls, no side effects. Takes data as arguments, returns results. This is the most
-important business logic in the entire project.
+calls, no side effects. V1 uses Z-score only. IQR detection is deferred to V2.
 
 **`services/detector.py`:**
 
 ```python
-from dataclasses import dataclass
-from decimal import Decimal
+from dataclasses import dataclass, field
 from typing import Optional
+
+ZSCORE_THRESHOLD = 2.5
 
 @dataclass
 class RollingStats:
@@ -639,16 +676,16 @@ class RollingStats:
     std_volume: float
     avg_price_change: float
     std_price_change: float
-    q1_price_change: float
-    q3_price_change: float
+    q1_price_change: float   # retained for schema compatibility; not used in V1
+    q3_price_change: float   # retained for schema compatibility; not used in V1
 
 @dataclass
 class DetectionResult:
     is_anomaly: bool
-    anomaly_type: Optional[str]   # "volume_spike" | "price_swing"
-    severity: Optional[str]       # "LOW" | "MEDIUM" | "HIGH"
+    anomaly_type: Optional[str]   # "volume_spike" | None
+    severity: Optional[str]       # "MEDIUM" | "HIGH" | None
     zscore: Optional[float]
-    iqr_flag: bool
+    iqr_flag: bool = False        # always False in V1; field retained for DB schema compatibility
 
 def detect_volume_zscore(current_volume: int, stats: RollingStats) -> tuple[float, bool]:
     """
@@ -659,55 +696,37 @@ def detect_volume_zscore(current_volume: int, stats: RollingStats) -> tuple[floa
     if stats.std_volume == 0:
         return 0.0, False
     zscore = (current_volume - stats.avg_volume) / stats.std_volume
-    return zscore, zscore > ZSCORE_THRESHOLD
+    return zscore, zscore >= ZSCORE_THRESHOLD
 
-def detect_price_swing_iqr(price_change_pct: float, stats: RollingStats) -> bool:
+def determine_severity(zscore: float) -> Optional[str]:
     """
-    Returns True if price_change is an IQR outlier.
-    Outlier = outside [Q1 - 1.5*IQR, Q3 + 1.5*IQR]
-    """
-    iqr = stats.q3_price_change - stats.q1_price_change
-    lower_fence = stats.q1_price_change - (1.5 * iqr)
-    upper_fence = stats.q3_price_change + (1.5 * iqr)
-    return price_change_pct < lower_fence or price_change_pct > upper_fence
+    V1 severity — Z-score only:
+    zscore > 3.5  → HIGH
+    zscore >= 2.5 → MEDIUM
+    below 2.5     → None (no anomaly)
 
-def determine_severity(zscore: float, iqr_flag: bool) -> Optional[str]:
+    IQR-based severity matrix is deferred to V2.
     """
-    Severity matrix:
-    zscore > 3.5 AND iqr_flag  → HIGH
-    zscore > 3.5               → MEDIUM
-    zscore > 2.5 AND iqr_flag  → MEDIUM
-    zscore > 2.5               → LOW
-    iqr_flag only              → LOW
-    neither                    → None (no anomaly)
-    """
-    if zscore > 3.5 and iqr_flag:
+    if zscore > 3.5:
         return "HIGH"
-    elif zscore > 3.5:
+    elif zscore >= ZSCORE_THRESHOLD:
         return "MEDIUM"
-    elif zscore > 2.5 and iqr_flag:
-        return "MEDIUM"
-    elif zscore > 2.5:
-        return "LOW"
-    elif iqr_flag:
-        return "LOW"
     return None
 
 def run_detection(candle: dict, stats: RollingStats) -> DetectionResult:
     """
     Main entry point. Takes one candle + rolling stats, returns DetectionResult.
+    V1: Z-score only. IQR detection is deferred to V2.
     """
-    price_change = float((candle["close"] - candle["open"]) / candle["open"] * 100)
     zscore, volume_spike = detect_volume_zscore(candle["volume"], stats)
-    iqr_flag = detect_price_swing_iqr(price_change, stats)
-    severity = determine_severity(zscore, iqr_flag)
-    
+    severity = determine_severity(zscore)
+
     return DetectionResult(
         is_anomaly=severity is not None,
-        anomaly_type="volume_spike" if volume_spike else ("price_swing" if iqr_flag else None),
+        anomaly_type="volume_spike" if volume_spike else None,
         severity=severity,
         zscore=zscore,
-        iqr_flag=iqr_flag
+        iqr_flag=False   # V1: IQR not implemented
     )
 ```
 
@@ -716,61 +735,65 @@ results. The Celery task handles all DB reads/writes around the service call. Th
 the detection logic can be unit tested with zero database, zero mocking, zero infrastructure.
 
 **Done when:** `python -c "from app.services.detector import run_detection"` imports
-without error. No database imports anywhere in the file.
+without error. No database imports anywhere in the file. No IQR functions anywhere in
+the file.
 
 ---
 
-### Task 2.4 — Write detector unit tests
+### Task 2.4 — Write detector unit tests (Z-score only)
 
-**What you're doing:** At least 8 unit tests covering every edge case. These tests run
-in milliseconds — no database, no network, no Docker required. Just Python.
+**What you're doing:** At least 8 unit tests covering every Z-score edge case. These tests
+run in milliseconds — no database, no network, no Docker required. Just Python.
+
+**V1 constraint:** All IQR test cases are removed. Tests cover Z-score thresholds and
+the simplified severity matrix only.
 
 **`tests/test_detector.py`** — required test cases:
 
 ```
 test_no_anomaly_on_normal_data
-    Input: volume at exactly the mean, price change in normal range
-    Expected: DetectionResult(is_anomaly=False)
+    Input: volume at exactly the mean (zscore = 0)
+    Expected: DetectionResult(is_anomaly=False, severity=None)
 
 test_volume_spike_detected_above_threshold
-    Input: volume = mean + (3 * std)  # clearly above 2.5 threshold
-    Expected: is_anomaly=True, anomaly_type="volume_spike"
+    Input: volume = mean + (3 * std)  # zscore = 3.0, above 2.5 threshold
+    Expected: is_anomaly=True, anomaly_type="volume_spike", severity="MEDIUM"
 
 test_borderline_volume_just_below_threshold
-    Input: volume = mean + (2.4 * std)  # just below 2.5
-    Expected: is_anomaly=False
+    Input: volume = mean + (2.4 * std)  # zscore = 2.4, just below 2.5
+    Expected: is_anomaly=False, severity=None
 
 test_borderline_volume_just_above_threshold
-    Input: volume = mean + (2.6 * std)  # just above 2.5
-    Expected: is_anomaly=True
+    Input: volume = mean + (2.6 * std)  # zscore = 2.6, just above 2.5
+    Expected: is_anomaly=True, severity="MEDIUM"
 
-test_empty_candle_list_raises_or_returns_none
+test_zscore_exactly_at_threshold_is_medium
+    Input: volume such that zscore = exactly 2.5
+    Expected: is_anomaly=True, severity="MEDIUM"
+
+test_zscore_above_3_5_is_high
+    Input: volume = mean + (4 * std)  # zscore = 4.0
+    Expected: severity="HIGH"
+
+test_zscore_between_2_5_and_3_5_is_medium
+    Input: volume = mean + (3.0 * std)  # zscore = 3.0
+    Expected: severity="MEDIUM"
+
+test_zero_std_returns_no_anomaly
     Input: stats with std_volume=0 (no variance in data)
-    Expected: zscore=0.0, no anomaly (division by zero handled)
-
-test_single_candle_no_historical_data
-    Input: stats with avg=current volume (zscore would be 0)
-    Expected: no anomaly
+    Expected: zscore=0.0, is_anomaly=False — no ZeroDivisionError raised
 
 test_all_identical_volumes
-    Input: std_volume=0 (flat line)
+    Input: std_volume=0 (flat line, all candles same volume)
     Expected: no anomaly, no ZeroDivisionError
 
-test_extreme_outlier_scores_high_severity
-    Input: volume = mean + (5 * std), price change outside IQR fences
-    Expected: severity="HIGH", iqr_flag=True
-
-test_iqr_only_anomaly_scores_low
-    Input: volume below zscore threshold, price change outside IQR fences
-    Expected: severity="LOW", anomaly_type="price_swing"
-
-test_severity_matrix_high_requires_both_signals
-    Input: zscore=4.0, iqr_flag=False
-    Expected: severity="MEDIUM" (not HIGH — needs both)
+test_iqr_flag_always_false
+    Input: any candle + any stats
+    Expected: DetectionResult.iqr_flag is always False in V1
 ```
 
-**Done when:** `pytest tests/test_detector.py -v` shows 10+ tests passing. Zero database
-connections made during this test run.
+**Done when:** `pytest tests/test_detector.py -v` shows 10 tests passing. Zero database
+connections made during this test run. No IQR test cases present anywhere in the file.
 
 ---
 
@@ -824,262 +847,144 @@ async def detect_anomalies(ticker: str):
         generate_report.si(str(anomaly.id)).delay()
 ```
 
-**Done when:** Seed 2 weeks of historical data, run `CALL
+**Done when:** Seed 2 weeks of historical TSLA data, run `CALL
 refresh_continuous_aggregate('market_data_stats', NULL, NULL)` in psql, then trigger
-detection manually. Check the anomalies table. You should see 2–8 anomalies per ticker
-per week. If you see hundreds, your threshold is too low. If you see zero, your continuous
+detection manually. Check the anomalies table. You should see 2–8 anomalies per week.
+If you see hundreds, your threshold is too low. If you see zero, your continuous
 aggregate hasn't refreshed — run the manual refresh call.
 
 ---
 
-### Task 2.6 — Write the report task (stub only)
+### Task 2.6 — Write the report task (V1: mock report written to DB)
 
-**What you're doing:** Write the report task skeleton so the detection task chain doesn't
-fail. The real implementation is Phase 3. For now it just logs the anomaly_id and returns.
+**What you're doing:** The report task that fires after every anomaly. In V1 with
+`USE_MOCK_REPORTS=true`, this task writes a hardcoded mock report to the database
+immediately and marks the anomaly as completed. No Claude call, no network request.
+
+**V1 constraint:** This is not a logging stub — it writes a real row to the `reports`
+table and sets `report_status = "completed"` on the anomaly. The GET /api/v1/reports/{id}
+endpoint will return this data immediately when the frontend polls.
+
+**`workers/report_task.py`:**
 
 ```python
 @app.task
 async def generate_report(anomaly_id: str):
-    logger.info(f"Report generation stub called for {anomaly_id}")
-    # Real implementation in Phase 3
+    async with get_db_session() as session:
+        anomaly = await anomaly_repo.get_by_id(uuid.UUID(anomaly_id), session)
+        if anomaly is None:
+            logger.error(f"Anomaly {anomaly_id} not found — skipping report generation")
+            return
+
+        # Idempotency check — don't write a second report if task retries
+        existing = await report_repo.get_by_anomaly_id(anomaly.id, session)
+        if existing is not None:
+            logger.info(f"Report already exists for {anomaly_id}, skipping")
+            return
+
+        # V1: hardcoded mock report — no Claude call
+        await report_repo.create(ReportCreate(
+            anomaly_id=anomaly.id,
+            summary=(
+                f"Automated analysis: {anomaly.ticker} recorded a statistically significant "
+                f"volume deviation (Z-score: {anomaly.zscore:.2f}) relative to its 20-period "
+                f"rolling mean. This qualifies as a {anomaly.severity.value} severity anomaly "
+                f"under the current detection threshold."
+            ),
+            reasons=[
+                f"Volume Z-score of {anomaly.zscore:.2f} exceeded the detection threshold of 2.5",
+                "Deviation is statistically significant relative to the rolling baseline",
+                "No confounding signals evaluated in V1 — single-signal Z-score detection",
+            ],
+            risk_level=anomaly.severity.value.capitalize(),
+            confidence=0.70,
+            tokens_used=0,
+            latency_ms=0,
+        ), session)
+
+        await anomaly_repo.update_report_status(anomaly.id, ReportStatus.completed, session)
+        logger.info(f"Mock report written for anomaly {anomaly_id}")
 ```
 
-**Done when:** Full pipeline runs without errors — ingestion → detection → report stub.
-No task failures in Celery logs.
+**Done when:** Full pipeline runs without errors — ingestion → detection → report task.
+Check the `reports` table: a row exists for the anomaly with a non-empty `summary` and
+a `reasons` array. Check the `anomalies` table: `report_status` is `"completed"`. No
+task failures in Celery logs.
 
 ---
 
 ### Phase 2 — Complete done-when
 
 - [ ] `celery -A workers.celery_app worker` starts and connects to Redis
-- [ ] Manual ingestion task call inserts rows into market_data
+- [ ] Manual ingestion task call inserts TSLA rows into market_data
 - [ ] Second call doesn't insert duplicates (idempotency)
-- [ ] `pytest tests/test_detector.py -v` — 10+ tests passing, zero DB connections
-- [ ] Full chain: ingestion → detection → report stub — runs without errors
-- [ ] 2–8 anomalies per ticker visible in DB after seeding + detection run
+- [ ] `pytest tests/test_detector.py -v` — 10 tests passing, zero DB connections, Z-score only cases, no IQR tests
+- [ ] Full chain: ingestion → detection → report task — runs without errors
+- [ ] Report row exists in DB with `report_status = "completed"` after full chain runs
+- [ ] 2–8 TSLA anomalies visible in DB after seeding + detection run
 
 ---
 
 ## Phase 3 — AI Report Generation
-**Time estimate: 6–8 hours**
-**Goal: Anomalies trigger Claude (or mock) report generation. Reports are structured JSON
-stored in DB. Langfuse traces every call.**
+**SKIPPED IN V1 — Deferred to V2**
+
+> In V1, `USE_MOCK_REPORTS=true` is always set. The report task (Task 2.6) writes a
+> hardcoded mock report to the database immediately after anomaly detection — no Claude
+> API call is made, no Langfuse traces are emitted, no SSE stream exists.
+>
+> Phase 3 is the full V2 implementation. It covers:
+> - Real Claude API call with structured JSON parsing (`services/reporter.py`)
+> - Two-attempt parse-retry logic with stricter prompt on second attempt
+> - Langfuse tracing (tokens, latency, ticker, severity per call)
+> - SSE streaming endpoint (`GET /api/v1/reports/{id}/stream`) returning tokens progressively
+>
+> **Do not implement Phase 3 until V2 work begins. All four tasks below are deferred.**
+> When V2 is ready, implement Phase 3 in full and set `USE_MOCK_REPORTS=false` only after
+> all done-when conditions below pass.
 
 ---
 
 ### Task 3.1 — Write the reporter service
+**SKIPPED IN V1**
 
-**What you're doing:** The service that builds prompts, calls Claude, parses the
-structured JSON response, and handles failures. Pure business logic — no DB calls.
-
-**`services/reporter.py`:**
-
-**System prompt (engineer this carefully):**
-```
-You are a financial market analyst. You will be given data about an unusual market event.
-Your job is to provide a factual, data-driven explanation of what the data shows.
-
-Rules:
-- Reference only the specific numbers provided. Do not speculate about future price moves.
-- Do not give buy/sell recommendations.
-- Respond ONLY with valid JSON. No preamble, no explanation, no markdown.
-- The JSON must match this exact schema: {"summary": string, "reasons": [string], "risk_level": "Low"|"Medium"|"High", "confidence": float 0-1}
-```
-
-**User prompt template:**
-```python
-def build_prompt(anomaly: Anomaly, candles: list, stats: RollingStats) -> str:
-    return f"""
-Market anomaly detected for {anomaly.ticker} at {anomaly.candle_time.isoformat()}.
-
-Anomaly type: {anomaly.type.value}
-Severity: {anomaly.severity.value}
-Z-score: {anomaly.zscore:.2f} (volume was {anomaly.zscore:.1f} standard deviations above the 20-period mean)
-
-Current candle:
-- Volume: {candles[0].volume:,} shares
-- Price move: {((candles[0].close - candles[0].open) / candles[0].open * 100):.2f}% intraday
-- Open: ${candles[0].open}, Close: ${candles[0].close}
-
-Rolling statistics (last 20 periods):
-- Average volume: {stats.avg_volume:,.0f} shares
-- Volume std dev: {stats.std_volume:,.0f} shares
-- Normal price change range: {stats.q1_price_change:.2f}% to {stats.q3_price_change:.2f}%
-
-Respond with JSON only.
-"""
-```
-
-**Parse + retry logic:**
-```python
-async def generate_report(anomaly, candles, stats) -> ReportSchema:
-    if settings.use_mock_reports:
-        return mock_report()
-    
-    prompt = build_prompt(anomaly, candles, stats)
-    
-    # Attempt 1
-    raw = await call_claude(prompt)
-    try:
-        return ReportSchema.model_validate_json(raw)
-    except ValidationError:
-        logger.warning("First parse failed, retrying with stricter prompt")
-    
-    # Attempt 2 — stricter prompt
-    strict_prompt = prompt + "\n\nCRITICAL: Your last response was not valid JSON. Respond with ONLY the JSON object, nothing else."
-    raw2 = await call_claude(strict_prompt)
-    try:
-        return ReportSchema.model_validate_json(raw2)
-    except ValidationError:
-        # Log both to Langfuse, raise to mark task as failed
-        log_failed_attempts(anomaly.id, prompt, raw, strict_prompt, raw2)
-        raise ReportGenerationError("Both parse attempts failed")
-```
-
-**Done when:** `USE_MOCK_REPORTS=true` — calling `generate_report()` returns a valid
-`ReportSchema` without any network calls. `USE_MOCK_REPORTS=false` with a valid
-`ANTHROPIC_API_KEY` — real Claude response is parsed and returned.
+The reporter service (`services/reporter.py`) builds the Claude prompt from anomaly +
+candle context, calls the Anthropic API, parses the structured JSON response, and handles
+parse failures with a retry. Implement in V2.
 
 ---
 
 ### Task 3.2 — Add Langfuse tracing
+**SKIPPED IN V1**
 
-**What you're doing:** Wrap every Claude call in a Langfuse trace. Track: tokens used,
-latency, anomaly metadata (ticker, severity), whether parse succeeded or failed.
-
-```python
-from langfuse import Langfuse
-from langfuse.decorators import observe
-
-langfuse = Langfuse(
-    public_key=settings.langfuse_public_key,
-    secret_key=settings.langfuse_secret_key,
-    host=settings.langfuse_host
-)
-
-@observe(name="generate_anomaly_report")
-async def call_claude(prompt: str, anomaly_metadata: dict) -> str:
-    start = time.time()
-    response = anthropic_client.messages.create(
-        model="claude-sonnet-4-20250514",
-        max_tokens=500,
-        system=SYSTEM_PROMPT,
-        messages=[{"role": "user", "content": prompt}]
-    )
-    latency_ms = int((time.time() - start) * 1000)
-    
-    # Langfuse automatically captures via @observe decorator
-    # Add custom metadata
-    langfuse.trace(
-        metadata={
-            "ticker": anomaly_metadata["ticker"],
-            "severity": anomaly_metadata["severity"],
-            "latency_ms": latency_ms,
-            "tokens": response.usage.input_tokens + response.usage.output_tokens
-        }
-    )
-    
-    return response.content[0].text
-```
-
-**Done when:** Trigger a real Claude call (USE_MOCK_REPORTS=false). Open Langfuse
-dashboard. Trace is visible with correct token count and latency. This proves observability
-is working before you ship to production.
+Wrap every Claude call in a Langfuse `@observe` decorator. Track tokens used, latency,
+anomaly metadata, and parse success/failure. Implement in V2.
 
 ---
 
 ### Task 3.3 — Wire up the real report task
+**SKIPPED IN V1**
 
-**What you're doing:** Replace the Phase 2 stub with the real implementation. The task
-fetches all context, calls the reporter service, writes to DB, updates anomaly status,
-publishes to Redis.
-
-**`workers/report_task.py` full implementation:**
-
-```python
-@app.task(bind=True, max_retries=1)
-async def generate_report(self, anomaly_id: str):
-    async with get_db_session() as session:
-        # Fetch context
-        anomaly = await anomaly_repo.get_by_id(uuid.UUID(anomaly_id), session)
-        if anomaly is None:
-            logger.error(f"Anomaly {anomaly_id} not found")
-            return
-        
-        # Check if report already exists (idempotency)
-        existing = await report_repo.get_by_anomaly_id(anomaly.id, session)
-        if existing is not None:
-            logger.info(f"Report already exists for {anomaly_id}, skipping")
-            return
-        
-        candles, _ = await market_repo.get_candles(anomaly.ticker, hours=1, limit=10, session=session)
-        stats = await market_repo.get_rolling_stats(anomaly.ticker, session)
-        
-        try:
-            report_data = await reporter.generate_report(anomaly, candles, stats)
-            
-            # Write to DB
-            report = await report_repo.create(ReportCreate(
-                anomaly_id=anomaly.id,
-                **report_data.model_dump(),
-            ), session)
-            
-            # Update anomaly status
-            await anomaly_repo.update_report_status(anomaly.id, ReportStatus.completed, session)
-            
-            # Notify frontend via Redis
-            await redis_client.publish(
-                f"report_ready:{anomaly_id}",
-                json.dumps({"anomaly_id": anomaly_id})
-            )
-            
-        except ReportGenerationError:
-            await anomaly_repo.update_report_status(anomaly.id, ReportStatus.failed, session)
-```
-
-**Done when:** Trigger detect_anomalies manually for a ticker with seeded data. Check
-reports table — a row should exist with valid JSON in the `reasons` column. Check anomalies
-table — `report_status` should be "completed".
+Replace the V1 mock report task with a full implementation: fetch context, call reporter
+service, write to DB, update anomaly status, publish `report_ready` event to Redis.
+Implement in V2.
 
 ---
 
 ### Task 3.4 — Write SSE streaming endpoint
+**SKIPPED IN V1**
 
-**What you're doing:** An endpoint that streams Claude's response token-by-token as it
-generates. The frontend connects via `EventSource` and shows text appearing in real time.
-
-**`api/v1/reports.py`** — SSE endpoint:
-
-```python
-@router.get("/reports/{anomaly_id}/stream")
-async def stream_report(anomaly_id: uuid.UUID):
-    async def event_generator():
-        async with anthropic_client.messages.stream(
-            model="claude-sonnet-4-20250514",
-            max_tokens=500,
-            system=SYSTEM_PROMPT,
-            messages=[{"role": "user", "content": prompt}]
-        ) as stream:
-            async for text in stream.text_stream:
-                yield f"data: {json.dumps({'token': text})}\n\n"
-        yield "data: [DONE]\n\n"
-    
-    return StreamingResponse(event_generator(), media_type="text/event-stream")
-```
-
-**Done when:** `curl -N http://localhost:8000/api/v1/reports/{id}/stream` shows tokens
-arriving one by one in the terminal. `[DONE]` appears at the end.
+`GET /api/v1/reports/{anomaly_id}/stream` — streams Claude's response token-by-token
+using `StreamingResponse`. Frontend connects via `EventSource`. Implement in V2.
 
 ---
 
 ### Phase 3 — Complete done-when
 
-- [ ] `USE_MOCK_REPORTS=true` — full pipeline runs, reports written to DB, zero Claude API calls
-- [ ] `USE_MOCK_REPORTS=false` — real Claude response parsed and stored
-- [ ] Langfuse dashboard shows traces with token counts and latency
-- [ ] Both parse-fail paths tested: first attempt fails → retry → second fails → status="failed"
-- [ ] SSE stream endpoint returns tokens progressively
-- [ ] `pytest tests/test_detector.py tests/test_repos.py -v` — all still passing
+> **All Phase 3 done-when conditions are deferred to V2.**
+>
+> V1 gate (already satisfied by Task 2.6):
+> - `USE_MOCK_REPORTS=true` — full pipeline runs, mock reports written to DB with
+>   `report_status="completed"`, zero Claude API calls made.
 
 ---
 
@@ -1222,8 +1127,8 @@ Message appears in wscat within 2 seconds.
 
 ## Phase 5 — Frontend Foundation
 **Time estimate: 6–8 hours**
-**Goal: React app renders real candlestick data with anomaly markers. TypeScript compiles
-with zero errors. All API hooks written.**
+**Goal: React app compiles with zero TypeScript errors. All Zod schemas written. All
+TanStack Query hooks written and returning typed data.**
 
 ---
 
@@ -1506,123 +1411,64 @@ Resizing the window resizes the chart. Zero TypeScript errors.
 ---
 
 ## Phase 6 — Frontend UI
-**Time estimate: 8–10 hours**
-**Goal: Full end-to-end user experience. Anomaly detected → card appears in feed →
-click → streaming report drawer. Zero TypeScript errors.**
+**Time estimate: 6–8 hours**
+**Goal: Anomaly list renders and polls for new data every 30 seconds. Clicking an anomaly
+opens a report drawer that shows the completed mock report. Zero TypeScript errors.**
+
+> V1 simplifications applied to this phase:
+> - WebSocket manager class removed entirely — no `lib/websocket.ts`
+> - WebSocket hook removed — replaced with TanStack Query `refetchInterval: 30000`
+> - SSE streaming removed from ReportDrawer — report fetched via `GET /api/v1/reports/{id}`, static display
+> - TradingView chart not included in the dashboard layout
+> - Sonner toast removed — no WebSocket events to trigger it
+> - LiveIndicator removed — no connection state to display
+> - Watchlist bar simplified to a static TSLA label (no ticker switching in V1)
 
 ---
 
-### Task 6.1 — WebSocket manager class
+### Task 6.1 — Configure polling on useAnomalies hook
 
-**What you're doing:** A singleton class that manages the WebSocket connection,
-reconnection logic, and event dispatching. This is custom code — no library handles
-this exact pattern for you.
+**What you're doing:** In V1, the anomaly feed stays current via TanStack Query's
+`refetchInterval`. No WebSocket connection, no custom event handling — just a periodic
+REST refetch every 30 seconds.
 
-```typescript
-// lib/websocket.ts
-type WSEventHandler = (data: unknown) => void
-
-class WebSocketManager {
-  private ws: WebSocket | null = null
-  private handlers: Map<string, WSEventHandler[]> = new Map()
-  private reconnectDelay = 1000
-  private maxDelay = 30000
-  
-  connect(url: string) {
-    this.ws = new WebSocket(url)
-    
-    this.ws.onmessage = (event) => {
-      const message = JSON.parse(event.data)
-      const handlers = this.handlers.get(message.type) ?? []
-      handlers.forEach(h => h(message.data))
-    }
-    
-    this.ws.onclose = () => {
-      // Exponential backoff reconnection
-      setTimeout(() => {
-        this.reconnectDelay = Math.min(this.reconnectDelay * 2, this.maxDelay)
-        this.connect(url)
-      }, this.reconnectDelay)
-    }
-    
-    this.ws.onopen = () => {
-      this.reconnectDelay = 1000  // reset on successful connection
-    }
-  }
-  
-  on(type: string, handler: WSEventHandler) {
-    const existing = this.handlers.get(type) ?? []
-    this.handlers.set(type, [...existing, handler])
-  }
-  
-  off(type: string, handler: WSEventHandler) {
-    const existing = this.handlers.get(type) ?? []
-    this.handlers.set(type, existing.filter(h => h !== handler))
-  }
-}
-
-// Singleton — one instance for the entire app
-export const wsManager = new WebSocketManager()
-```
-
-**Done when:** `wsManager.connect(url)` establishes connection. Manually closing the
-connection in Chrome DevTools → reconnects after 1 second. Closing again → 2 seconds.
-Again → 4 seconds.
-
----
-
-### Task 6.2 — React WebSocket hook
-
-**What you're doing:** A hook that connects the WebSocket manager to TanStack Query
-cache. New anomaly events update the query cache directly — no refetch needed.
+Update `features/anomalies/useAnomalies.ts` (written in Phase 5) to add `refetchInterval`:
 
 ```typescript
-// lib/websocket.ts (hook)
-export function useWebSocket() {
-  const queryClient = useQueryClient()
-  const [status, setStatus] = useState<"connected"|"reconnecting"|"disconnected">("disconnected")
-  
-  useEffect(() => {
-    wsManager.connect(import.meta.env.VITE_WS_URL)
-    
-    const handleAnomaly = (data: unknown) => {
-      const anomaly = AnomalySchema.parse(data)
-      
-      // Update cache directly — no network request
-      queryClient.setQueryData(["anomalies"], (old: AnomalyListResponse | undefined) => ({
-        ...old,
-        data: [anomaly, ...(old?.data ?? [])].slice(0, 50)  // keep last 50
-      }))
-      
-      // Toast for HIGH severity
-      if (anomaly.severity === "HIGH") {
-        toast.error(`HIGH severity anomaly: ${anomaly.ticker} ${anomaly.type}`)
-      }
-    }
-    
-    wsManager.on("anomaly", handleAnomaly)
-    return () => wsManager.off("anomaly", handleAnomaly)
-  }, [queryClient])
-  
-  return { status }
+export function useAnomalies(ticker?: string, severity?: Severity) {
+  return useQuery({
+    queryKey: ["anomalies", ticker, severity],
+    queryFn: () => fetchValidated(
+      "/api/v1/anomalies",
+      AnomalyListResponseSchema,
+      { ticker, severity, hours: 24 }
+    ),
+    staleTime: 30_000,
+    refetchInterval: 30_000,   // V1: poll every 30 seconds
+  })
 }
 ```
 
-**Done when:** Keep the browser open. Manually trigger detection from the terminal.
-Anomaly card appears in the frontend feed within 2 seconds WITHOUT a page refresh.
+**Why refetchInterval instead of WebSocket:** WebSocket requires a persistent server-side
+connection, a Redis Pub/Sub subscriber, reconnection logic on the client, and real-time
+event handling. For V1, polling every 30 seconds is sufficient — anomalies do not need
+to appear in under 30 seconds to be useful. The entire change is one added line.
+
+**Done when:** Browser DevTools network tab shows `GET /api/v1/anomalies` firing every
+30 seconds automatically. No WebSocket connection visible in the WS tab.
 
 ---
 
-### Task 6.3 — Anomaly feed with animation
+### Task 6.2 — Anomaly feed
 
-**What you're doing:** scrollable list of anomaly cards. New cards animate in from the
-top. Cards are clickable and open the report drawer.
+**What you're doing:** Scrollable list of anomaly cards. Cards are clickable and open
+the report drawer. Feed data comes entirely from the polling hook — no WebSocket, no
+manual cache mutations.
 
 **`features/anomalies/AnomalyFeed.tsx`** — key behaviors:
-- Uses `useAnomalies()` hook for initial data
-- `useWebSocket()` hook keeps cache updated in real time
+- Uses `useAnomalies()` hook (polling at 30s interval from Task 6.1)
 - shadcn `ScrollArea` for the list container
-- `framer-motion` or CSS animation for card entrance
+- CSS animation for card entrance (e.g. `animate-in fade-in slide-in-from-top-2`)
 - Each card shows: ticker, severity badge, type, time, z-score
 - Clicking a card calls `setOpenDrawer(anomaly.id)`
 
@@ -1632,88 +1478,82 @@ top. Cards are clickable and open the report drawer.
 - Z-score shown to 2 decimal places
 - Subtle border-left color matching severity
 
-**Done when:** Feed shows initial data on load. New anomaly triggered manually appears
-at top of feed with animation within 2 seconds. HIGH severity fires a toast notification.
+**Done when:** Feed shows initial data on page load. After 30 seconds, network tab shows
+a refetch and the feed reflects any new anomalies without a page refresh. Zero TypeScript
+errors.
 
 ---
 
-### Task 6.4 — Report drawer with SSE streaming
+### Task 6.3 — Report drawer (REST only)
 
-**What you're doing:** A shadcn `Sheet` (side drawer) that opens when a card is clicked.
-Fetches the report — if pending, opens SSE connection and streams tokens as Claude generates.
+**What you're doing:** A shadcn `Sheet` (side drawer) that opens when an anomaly card
+is clicked. Fetches the completed mock report via `GET /api/v1/reports/{anomaly_id}` and
+displays the static report text. No SSE, no streaming, no EventSource.
 
 ```typescript
 // features/reports/ReportDrawer.tsx
 
 export function ReportDrawer() {
   const { openDrawerAnomalyId, setOpenDrawer } = useUIStore()
-  const [streamedText, setStreamedText] = useState("")
-  
-  useEffect(() => {
-    if (!openDrawerAnomalyId) return
-    
-    const es = new EventSource(
-      `${import.meta.env.VITE_API_BASE_URL}/api/v1/reports/${openDrawerAnomalyId}/stream`
-    )
-    
-    es.onmessage = (event) => {
-      if (event.data === "[DONE]") { es.close(); return }
-      const { token } = JSON.parse(event.data)
-      setStreamedText(prev => prev + token)
-    }
-    
-    es.onerror = () => es.close()
-    
-    return () => es.close()
-  }, [openDrawerAnomalyId])
-  
+  const { data, isLoading } = useReport(openDrawerAnomalyId ?? "")
+
   return (
     <Sheet open={!!openDrawerAnomalyId} onOpenChange={() => setOpenDrawer(null)}>
       <SheetContent>
-        <div className="prose">{streamedText || "Generating report..."}</div>
+        {isLoading && (
+          <p className="text-muted-foreground">Loading report...</p>
+        )}
+        {data?.status === "completed" && (
+          <div className="space-y-4">
+            <p className="text-sm leading-relaxed">{data.report.summary}</p>
+            <ul className="list-disc pl-4 space-y-1">
+              {data.report.reasons.map((r, i) => (
+                <li key={i} className="text-sm text-muted-foreground">{r}</li>
+              ))}
+            </ul>
+            <div className="flex gap-4 text-xs text-muted-foreground">
+              <span>Risk: {data.report.risk_level}</span>
+              <span>Confidence: {(data.report.confidence * 100).toFixed(0)}%</span>
+            </div>
+          </div>
+        )}
+        {data?.status === "pending" && (
+          <p className="text-muted-foreground">Report is being generated...</p>
+        )}
+        {data?.status === "failed" && (
+          <p className="text-destructive">Report generation failed.</p>
+        )}
       </SheetContent>
     </Sheet>
   )
 }
 ```
 
-**Done when:** Click anomaly card → drawer opens → text appears character by character
-as Claude generates. If report is already completed, full text appears immediately.
-Closing drawer stops the SSE connection.
+**Why no SSE:** In V1, `USE_MOCK_REPORTS=true` means the report task writes to the DB
+synchronously and immediately marks `report_status = "completed"`. By the time the user
+clicks an anomaly card, the report already exists. There is nothing to stream.
+
+**Done when:** Click any anomaly card → drawer opens → report summary and reasons display
+immediately. Closing the drawer clears `openDrawerAnomalyId`. No EventSource connection
+is created anywhere in the component. Zero TypeScript errors.
 
 ---
 
-### Task 6.5 — Connection status indicator + watchlist bar
-
-**`components/LiveIndicator.tsx`:** Pulsing green dot when WebSocket is connected.
-Yellow pulsing when reconnecting. Red when disconnected. Shows the string "Live" /
-"Reconnecting..." / "Disconnected" next to the dot.
-
-**`features/watchlist/WatchlistBar.tsx`:** Row of ticker buttons at the top. Each shows
-the ticker name and a badge with the count of HIGH severity anomalies in the last 24h.
-Clicking a ticker updates `selectedTicker` in Zustand store, which updates the chart
-and anomaly feed.
-
-**Done when:** Disconnect from WiFi → indicator shows "Reconnecting..." → reconnect →
-shows "Live" again. Clicking a ticker changes the chart data.
-
----
-
-### Task 6.6 — Dashboard page assembly
+### Task 6.4 — Dashboard page assembly
 
 **What you're doing:** `pages/Dashboard.tsx` assembles all components into the final
-layout. Two-column layout: chart + watchlist on the left, anomaly feed on the right.
+layout. In V1, the TradingView chart is absent — the AnomalyFeed is the primary surface.
 
-**Layout structure:**
+**V1 layout:**
 ```
 ┌─────────────────────────────────────────────┐
-│  FinPulse    [TSLA] [NVDA] [AAPL]   ● Live  │  ← header
-├─────────────────────┬───────────────────────┤
-│                     │                       │
-│   TradingChart      │   AnomalyFeed         │
-│   (60% width)       │   (40% width)         │
-│                     │                       │
-├─────────────────────┴───────────────────────┤
+│  FinPulse    TSLA                            │  ← header (static ticker label)
+├─────────────────────────────────────────────┤
+│                                             │
+│   AnomalyFeed (full width)                  │
+│   polling every 30 seconds                  │
+│                                             │
+├─────────────────────────────────────────────┤
 │  MetricCard  MetricCard  MetricCard          │  ← summary stats
 └─────────────────────────────────────────────┘
 ```
@@ -1721,145 +1561,65 @@ layout. Two-column layout: chart + watchlist on the left, anomaly feed on the ri
 **MetricCard stats to show:** Total anomalies today, HIGH severity count today,
 last ingestion time.
 
-**Done when:** Full layout renders correctly. All components visible. Responsive on
-different screen sizes. `tsc --noEmit` zero errors.
+**What is not in the V1 layout:**
+- No TradingView chart — the chart column is absent, not commented out
+- No LiveIndicator — no WebSocket connection state to show
+- No ticker switcher — TSLA is a static label in the header
+
+**Done when:** Full layout renders correctly. AnomalyFeed visible and updating every
+30 seconds. MetricCards show real counts from the API. `tsc --noEmit` zero errors.
 
 ---
 
 ### Phase 6 — Complete done-when
 
-- [ ] Full end-to-end flow: anomaly detected → card appears → click → streaming report
-- [ ] WebSocket reconnects automatically with exponential backoff
-- [ ] HIGH severity fires sonner toast
+- [ ] `useAnomalies` hook refetches every 30 seconds — confirmed in browser DevTools network tab
+- [ ] AnomalyFeed renders anomaly cards from polled data
+- [ ] Clicking a card opens ReportDrawer and displays mock report summary + reasons
+- [ ] No WebSocket connection present in browser DevTools WS tab
+- [ ] No SSE / EventSource connection opened anywhere in the frontend
+- [ ] TradingView chart is absent from the layout — not stubbed, not commented out
 - [ ] `tsc --noEmit` zero errors — no exceptions, no suppressions
-- [ ] LiveIndicator shows correct connection state
-- [ ] Watchlist ticker switching updates chart and feed
 
 ---
 
 ## Phase 7 — MCP Server
-**Time estimate: 4–5 hours**
-**Goal: Claude Desktop can query live FinPulse data using natural language.**
+**SKIPPED IN V1 — Deferred to V2**
+
+> The MCP server gives Claude Desktop natural-language access to live FinPulse data via
+> three tools: `get_anomalies`, `get_report`, and `get_market_summary`. In V1, all data
+> is already accessible via the REST API. The MCP layer is a convenience for Claude
+> Desktop users and is not required for the product to function.
+>
+> Phase 7 is the full V2 implementation. It covers:
+> - MCP server entry point (`mcp_server/server.py`) using the `mcp` Python SDK
+> - Three tools with well-engineered descriptions that Claude selects correctly
+> - Claude Desktop configuration (`~/Library/Application Support/Claude/claude_desktop_config.json`)
+> - 10 natural-language query test suite verifying correct tool selection
+>
+> **Do not implement Phase 7 in V1. The `mcp_server/` folder exists with `.gitkeep` files
+> as required by the folder structure — do not add any real code there yet.**
 
 ---
 
 ### Task 7.1 — Write MCP server entry point
-
-**What you're doing:** A separate Python process that exposes three tools to Claude
-Desktop. No shared code with the backend — communicates only via REST API.
-
-```python
-# mcp_server/server.py
-from mcp.server import Server
-from mcp.server.stdio import stdio_server
-
-server = Server("finpulse")
-
-# Register tools
-from mcp_server.tools.anomalies import get_anomalies
-from mcp_server.tools.reports import get_report
-from mcp_server.tools.market import get_market_summary
-
-server.add_tool(get_anomalies)
-server.add_tool(get_report)
-server.add_tool(get_market_summary)
-
-if __name__ == "__main__":
-    stdio_server(server)
-```
-
-**Done when:** `python mcp_server/server.py` starts without errors.
+**SKIPPED IN V1**
 
 ---
 
 ### Task 7.2 — Write the three MCP tools
-
-**What you're doing:** Each tool is a function with a description, input schema, and
-implementation that calls the REST API. The description is the most important part.
-
-**Tool 1 — get_anomalies:**
-```python
-description = """
-Retrieves detected market anomalies for a specific stock ticker or across all monitored
-tickers. Use when the user asks about unusual market activity, volume spikes, abnormal
-price movements, or market alerts for any stock. Returns anomaly type (volume_spike or
-price_swing), severity level (LOW/MEDIUM/HIGH), Z-score value, and timestamp of detection.
-
-Examples:
-- "What anomalies happened in TSLA today?"
-- "Show me HIGH severity alerts from the last hour"
-- "Any unusual activity in NVDA?"
-"""
-```
-
-**Tool 2 — get_report:**
-```python
-description = """
-Retrieves the AI-generated analysis report for a specific anomaly. Use when the user
-wants to understand WHY an anomaly occurred or wants more detail about a specific alert.
-Requires an anomaly_id which can be obtained from get_anomalies. Returns a summary,
-list of reasons, risk level, and confidence score.
-"""
-```
-
-**Tool 3 — get_market_summary:**
-```python
-description = """
-Returns a summary of market activity across all monitored tickers for a given time
-period. Use when the user asks for an overview of market conditions, which stocks have
-been most active, or a general summary of anomaly activity. Returns anomaly counts
-per ticker, most recent anomaly per ticker, and overall activity level.
-"""
-```
-
-**Done when:** Each tool correctly calls the REST API and returns structured data.
-Test with `python -c "from mcp_server.tools.anomalies import get_anomalies"`.
+**SKIPPED IN V1**
 
 ---
 
 ### Task 7.3 — Configure Claude Desktop and test with 10 queries
-
-**What you're doing:** Add the MCP server to Claude Desktop config. Test with 10 real
-natural language queries to verify tools are invoked correctly.
-
-**Claude Desktop config (`~/Library/Application Support/Claude/claude_desktop_config.json`):**
-```json
-{
-  "mcpServers": {
-    "finpulse": {
-      "command": "python",
-      "args": ["/absolute/path/to/finpulse/mcp_server/server.py"],
-      "env": {
-        "BACKEND_URL": "http://localhost:8000"
-      }
-    }
-  }
-}
-```
-
-**10 test queries:**
-1. "What anomalies happened in TSLA in the last 24 hours?"
-2. "Show me all HIGH severity alerts today"
-3. "Any unusual activity in NVDA?"
-4. "Give me a summary of market activity today"
-5. "What was the Z-score for the last TSLA anomaly?"
-6. "Get the report for the most recent anomaly"
-7. "Which ticker had the most anomalies today?"
-8. "Were there any volume spikes in AAPL this week?"
-9. "What's the confidence score on the latest report?"
-10. "Compare anomaly activity between TSLA and NVDA today"
-
-**Done when:** All 10 queries return real data from your running system. Claude correctly
-selects the right tool for each query without being told which tool to use.
+**SKIPPED IN V1**
 
 ---
 
 ### Phase 7 — Complete done-when
 
-- [ ] MCP server starts without errors
-- [ ] All 3 tools have descriptions that would make sense to a new engineer reading them
-- [ ] All 10 test queries in Claude Desktop return real live data
-- [ ] Claude selects correct tools without explicit instruction
+> **All Phase 7 done-when conditions are deferred to V2.**
 
 ---
 
@@ -1904,7 +1664,7 @@ Verify the health endpoint.
 6. Set all environment variables in Railway dashboard (from .env.example)
 7. Run `alembic upgrade head` via Railway shell
 8. Run TimescaleDB setup SQL via Railway database shell
-9. Set `USE_MOCK_REPORTS=false` in production
+9. Keep `USE_MOCK_REPORTS=true` in production for V1
 
 **Done when:** `curl https://your-app.railway.app/api/v1/health` returns
 `{"status": "healthy"}`. Live URL is publicly accessible.
@@ -1917,11 +1677,10 @@ Verify the health endpoint.
 during US market hours (7pm–1:30am IST) so you have real anomalies firing.
 
 **Demo script:**
-- 0:00–0:15 — Show the dashboard with real tickers and live chart
-- 0:15–0:40 — Wait for or trigger an anomaly — show it appearing in the feed
-- 0:40–1:00 — Click the anomaly card, show the streaming report generating in real time
-- 1:00–1:20 — Switch to Claude Desktop, ask "What anomalies happened in TSLA today?"
-- 1:20–1:30 — Show the health endpoint and Langfuse dashboard briefly
+- 0:00–0:15 — Show the dashboard with the TSLA anomaly feed
+- 0:15–0:40 — Wait for or trigger an anomaly — show it appearing in the feed after the next poll
+- 0:40–1:10 — Click the anomaly card, show the report drawer with summary and reasons
+- 1:10–1:30 — Show the health endpoint and DB row counts confirming real data
 
 **Done when:** Loom link exists. Video shows all 4 of the above moments clearly.
 
@@ -1934,13 +1693,12 @@ code. It must answer: what does this do, how is it built, and why should I care.
 
 **Required sections:**
 - Live demo badge (link to Railway URL)
-- 30-second GIF of the real-time feed updating
+- 30-second GIF of the anomaly feed updating
 - What it does (1 paragraph, non-technical)
 - Architecture diagram (simple ASCII or image)
 - Tech stack table with brief why for each choice
 - Local setup instructions (`make dev`, then seed script)
 - Key engineering decisions (3–4 bullet points, one line each)
-- Langfuse observability screenshot
 
 **Done when:** A senior engineer could understand what this project does and how it's
 built from the README alone, without reading any code.
@@ -1962,15 +1720,15 @@ built from the README alone, without reading any code.
 
 - [ ] Phase 0: 6 containers start and are healthy with `make dev`
 - [ ] Phase 1: Migrations run, hypertable exists, repo tests pass
-- [ ] Phase 2: Ingestion fills DB, detector finds 2–8 anomalies/ticker/week, 10 unit tests pass
-- [ ] Phase 3: Reports generated (mock + real), Langfuse traces visible
+- [ ] Phase 2: TSLA ingestion fills DB, Z-score detector finds anomalies, 10 unit tests pass, mock reports written to DB with status "completed"
+- [ ] Phase 3: **SKIPPED IN V1** — deferred to V2 (Claude API, Langfuse, SSE streaming)
 - [ ] Phase 4: All API routes match contracts, WebSocket broadcasts in <2s
-- [ ] Phase 5: Chart renders real data, zero TypeScript errors
-- [ ] Phase 6: Full end-to-end flow working, reconnection works
-- [ ] Phase 7: 10 Claude Desktop queries return real data
+- [ ] Phase 5: Zod schemas match contracts, TanStack Query hooks return typed data, `tsc --noEmit` passes
+- [ ] Phase 6: Anomaly feed polls every 30s, report drawer shows mock report, zero TypeScript errors, no WebSocket or SSE
+- [ ] Phase 7: **SKIPPED IN V1** — deferred to V2 (MCP server, Claude Desktop)
 - [ ] Phase 8: Live URL, Loom, README complete
 
 ---
 
-*Total estimated time: 52–68 hours across 8–10 days of focused work.*
+*Total estimated time: 44–56 hours across 7–9 days of focused work.*
 *Do not rush Phase 0 and Phase 1. Every hour spent there saves three hours in later phases.*
