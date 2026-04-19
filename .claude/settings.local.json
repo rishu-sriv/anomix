@@ -22,7 +22,12 @@
       "Bash(brew upgrade:*)",
       "Bash(mkdir -p backend/app/core backend/app/models backend/app/schemas backend/app/repositories backend/app/services backend/migrations/versions frontend/src/app frontend/src/pages frontend/src/features/chart frontend/src/features/anomalies frontend/src/features/reports frontend/src/features/watchlist frontend/src/components/ui frontend/src/lib mcp_server/tools src/agents/prompts/tasks .github/workflows)",
       "Bash(find . -type d -empty -not -path \"./.git/*\" -not -path \"./node_modules/*\" -not -path \"./.pytest_cache/*\" -exec touch {}/.gitkeep \\\\;)",
-      "Bash(docker compose:*)"
+      "Bash(docker compose:*)",
+      "Bash(find:*)",
+      "Bash(python3:*)",
+      "Bash(cat)",
+      "Read(//tmp/**)",
+      "Bash(pip install:*)"
     ]
   }
 }
