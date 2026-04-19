@@ -1,336 +1,563 @@
-# FinPulse — CLAUDE.md
+# CLAUDE.md — FinPulse
 
-Multi-tenant FastAPI service for AI financial intelligence agents and the PulseIQ product layer.
-
----
-
-## Product context
-
-FinPulse is a financial intelligence platform. Tenants are financial firms, wealth managers, or individual investors. The core value is helping finance teams understand portfolio performance, manage risk, track financial goals, and surface actionable insights — all grounded in their actual market and transaction data.
-
-Two modes in the UI:
-- **Classic mode**: Agent cards — users chat with agents (portfolio analyst, risk analyst, market strategist, etc.)
-- **PulseIQ mode** (`pulseiq.intelligence_layer: true` in tenant config): Full feed — positions, alerts, risk signals, goal tracking, outcome attribution. Gated per tenant via `GET /api/pulseiq/config → { intelligence_layer: bool }`.
-
-The PulseIQ feed shows what financial signals were detected, what portfolio actions were taken, and whether those actions led to favorable outcomes — closing the loop between AI recommendations and real portfolio results.
+This file is the authoritative guide for Claude Code working in this repository.
+Read this entire file before touching any code. Every decision here has a reason.
+Do not deviate without understanding why the rule exists.
 
 ---
 
-## Core entity relationships
+## What this project is
 
-```
-Signal (signals)
-  ├── SignalOutcome (signal_outcomes)     — one per signal, CASCADE delete, computed async after settlement window
-  ├── SignalNote (signal_notes)           — analyst-added notes
-  └── SignalPeriodSummary                 — weekly/monthly rollup, LLM-generated
+FinPulse is a real-time financial market anomaly detection system. It ingests live
+OHLCV (Open, High, Low, Close, Volume) market data every 60 seconds, detects
+statistically unusual events using Z-score analysis, generates AI-powered research
+reports via the Claude API, and surfaces everything through a live React dashboard.
 
-Portfolio (portfolios)
-  └── Position (positions)               — one per (portfolio_id, ticker), tracks quantity and cost basis
+**This is a portfolio project built to production-grade standards.** Every architectural
+decision is documented and defensible. Do not simplify or shortcut — the complexity is
+intentional and demonstrates engineering maturity.
 
-Goals (goals)                            — one per (metric_key, period_label), tracks target vs actual
-  └── attribution computed in goals_store — outcomes of confirmed signals are attributed to matching goals
+**What FinPulse is NOT:** It is not a trading system. It does not give buy/sell signals.
+It does not manage portfolios. It observes and explains. It does not recommend.
 
-Alert (alerts)                           — triggered threshold breaches (price, risk, allocation drift)
-Transaction (transactions)               — buy/sell/dividend events
-```
-
-**Signal lifecycle:**
-1. Bulk-upserted from market data inference via `POST /api/signals/bulk-upsert` (source: equity, fx, macro, options, etc.)
-2. LLM fields (`title`, `description`, `inferred_reason`, `llm_summary`) filled async after insert
-3. Analyst confirms/dismisses/edits → status: `pending → confirmed | dismissed | edited`
-4. After `outcome_measure_after` date passes, outcome is computed and written to `signal_outcomes`
-5. Confirmed signals with outcomes get attributed to active goals via `goals_store`
-
-**Key non-obvious things:**
-- `outcome_measure_after = signal_date + effective_settlement_days` — set at creation, drives when grading runs
-- `SignalOutcome` has one-to-one with `Signal` (unique constraint on `signal_id`) — upsert, not insert
-- Outcomes have both a flat baseline (5-day pre-signal) and a trend-adjusted baseline (21-day regression) — both matter for verdict
-- `outcome_confidence` is reduced by confounding signals active in the same window
+**Current build: V1 scope**
+- One ticker only: TSLA
+- Z-score anomaly detection only (no IQR in V1)
+- Mock reports only (USE_MOCK_REPORTS=true — no real Claude API calls in V1)
+- REST polling every 30 seconds (no WebSocket in V1)
+- No TradingView chart in V1
+- No MCP server in V1
 
 ---
 
-## File map
-
-Use this as the first reference before exploring. Every directory and key file is listed here.
+## Repository structure
 
 ```
-FinPulse/
-├── config/
-│   └── settings.py                      — app-level env vars (Pydantic BaseSettings); not tenant-specific
+finpulse/
+├── backend/                          # Python FastAPI application
+│   ├── app/
+│   │   ├── main.py                   # FastAPI app factory
+│   │   ├── config.py                 # pydantic-settings Config — all env vars here
+│   │   ├── api/
+│   │   │   ├── deps.py               # Shared FastAPI dependencies
+│   │   │   └── v1/
+│   │   │       ├── router.py         # Mounts all v1 sub-routers
+│   │   │       ├── stocks.py
+│   │   │       ├── anomalies.py
+│   │   │       ├── reports.py
+│   │   │       └── health.py
+│   │   ├── core/
+│   │   │   ├── database.py           # SQLAlchemy async engine and session factory
+│   │   │   └── redis.py              # Redis connection pool
+│   │   ├── models/                   # SQLAlchemy ORM models (mapped_column syntax)
+│   │   │   ├── base.py
+│   │   │   ├── market_data.py
+│   │   │   ├── anomaly.py
+│   │   │   └── report.py
+│   │   ├── schemas/                  # Pydantic v2 request/response schemas
+│   │   │   ├── market.py
+│   │   │   ├── anomaly.py
+│   │   │   └── report.py
+│   │   ├── repositories/             # ALL database queries live here and ONLY here
+│   │   │   ├── market_repo.py
+│   │   │   ├── anomaly_repo.py
+│   │   │   └── report_repo.py
+│   │   └── services/                 # Business logic — no DB calls inside services
+│   │       ├── detector.py           # Pure functions: Z-score anomaly detection
+│   │       └── reporter.py           # Mock report generation (Claude API in V2)
+│   ├── workers/                      # Celery tasks — separate from API process
+│   │   ├── celery_app.py             # Celery app config + Beat schedule
+│   │   ├── ingestion_task.py         # Fetches TSLA data from yfinance every 60s
+│   │   ├── detection_task.py         # Runs detector, writes anomaly to DB
+│   │   └── report_task.py            # Writes mock report to DB
+│   ├── migrations/                   # Alembic migration files
+│   │   └── versions/
+│   ├── tests/
+│   │   ├── conftest.py
+│   │   ├── test_detector.py
+│   │   ├── test_repos.py
+│   │   └── test_api.py
+│   ├── alembic.ini
+│   ├── requirements.txt
+│   └── Dockerfile
 │
-├── database/
-│   ├── models/                          — SQLModel table definitions; one file per entity
-│   │   └── <entity>.py
-│   ├── migration_helpers.py             — idempotent helpers: add_column, create_index, drop_table, execute_sql, etc.
-│   └── migrations.py                    — run_migrations_for_tenant() called on startup per tenant
+├── frontend/                         # React 18 + TypeScript
+│   ├── src/
+│   │   ├── app/
+│   │   │   ├── providers.tsx
+│   │   │   └── store.ts              # Zustand — UI state only
+│   │   ├── pages/
+│   │   │   └── Dashboard.tsx
+│   │   ├── features/
+│   │   │   ├── anomalies/
+│   │   │   │   ├── AnomalyFeed.tsx
+│   │   │   │   ├── AnomalyCard.tsx
+│   │   │   │   └── useAnomalies.ts   # TanStack Query hook with 30s polling
+│   │   │   └── reports/
+│   │   │       ├── ReportDrawer.tsx
+│   │   │       └── useReport.ts
+│   │   ├── components/
+│   │   │   ├── ui/                   # shadcn components — do not edit
+│   │   │   ├── SeverityBadge.tsx
+│   │   │   └── MetricCard.tsx
+│   │   └── lib/
+│   │       ├── schemas.ts            # Zod schemas — single source of truth
+│   │       ├── api.ts                # Axios instance + Zod validation interceptor
+│   │       └── utils.ts
+│   ├── vite.config.ts                # Port 5173
+│   ├── tsconfig.json
+│   └── Dockerfile
 │
-├── src/
-│   ├── api/
-│   │   ├── app.py                       — FastAPI app init; all routers registered here
-│   │   ├── middleware/
-│   │   │   └── auth.py                  — tenant auth; sets tenant_id in contextvars, cleared after response
-│   │   └── routes/                      — one file per domain: <entity>_routes.py
-│   │
-│   ├── agents/
-│   │   ├── factory.py                   — AGENT_IDS list, _PIPELINE_AGENTS set, agent instantiation logic
-│   │   ├── <agent_id>.py                — LangGraph graph: orchestrator → batch → workers → synthesizer
-│   │   └── prompts/
-│   │       ├── <agent_id>.txt           — top-level agent system prompt
-│   │       ├── orchestration/           — orchestrator routing instructions per agent
-│   │       │   └── orchestrator_<agent_id>.txt
-│   │       ├── workers/                 — per-worker system prompts
-│   │       │   └── <worker_id>.txt
-│   │       └── tasks/                   — one-off task prompts (LLM-generated summaries, grading, etc.)
-│   │           └── <name>.txt
-│   │
-│   ├── cache/                           — Redis caching layers (context: 12h TTL, tools: 30m, history: 10m)
-│   ├── constants/                       — enums, signal status values, prompt maps, config constants
-│   ├── guardrails/                      — input validation and safety checks before agent execution
-│   ├── services/                        — business logic not in stores: artifact, alert, email, Slack
-│   │
-│   ├── store/
-│   │   ├── base_store.py                — BaseStore with get_session() context manager
-│   │   ├── pulseiq_store.py             — PulseIqStore: aggregates all domain stores; instantiated per request
-│   │   ├── __init__.py                  — exports all stores
-│   │   └── <entity>_store.py           — one per entity; never filter by tenant_id (isolated at DB level)
-│   │
-│   ├── tools/                           — LangChain @tool definitions; one file per domain
-│   │   ├── portfolio_tools.py
-│   │   ├── risk_tools.py
-│   │   ├── market_data_tools.py
-│   │   ├── macro_tools.py
-│   │   ├── signal_tools.py
-│   │   ├── alert_tools.py
-│   │   ├── artifact_tool.py
-│   │   └── flexible_query_tools.py
-│   │
-│   └── utils/
-│       ├── context.py                   — get_tenant_id() / set_tenant_id() via contextvars
-│       └── tenant_config.py             — tenant config loader (tenantConfig.yml locally, Vault in prod)
+├── mcp_server/                       # MCP server (V2 — skip in V1)
+│   ├── server.py
+│   └── tools/
 │
-├── tenantConfig.yml                     — tenant configs (local dev); use Vault secret refs in prod
+├── infra/
+│   ├── docker-compose.yml            # 6 services
+│   ├── nginx/
+│   │   └── nginx.conf
+│   └── db/
+│       └── init.sql                  # TimescaleDB extension setup
 │
-└── .claude/
-    └── commands/                        — Claude Code slash commands
-        ├── agents/
-        │   └── scaffold.md              — /agents:scaffold   scaffold a new LangGraph agent + prompts
-        ├── entities/
-        │   └── scaffold.md              — /entities:scaffold scaffold a new CRUD entity (model+store+route+migration)
-        ├── tools/
-        │   └── scaffold.md              — /tools:scaffold    add a new @tool to a domain tools file
-        ├── tenants/
-        │   └── onboard.md               — /tenants:onboard   add tenant config + init tenant DB
-        └── review/
-            └── standards.md             — /review:standards  audit changes against coding standards
+├── .github/
+│   └── workflows/
+│       └── ci.yml
+│
+├── ARCHITECTURE.md
+├── CLAUDE.md                         # This file
+├── .env.example
+└── Makefile
 ```
 
 ---
 
-## CRUD pattern
+## Tech stack
 
-Every entity follows the same structure. This is what keeps the codebase consistent and bug-free.
+### Backend
+| Technology | Version | Why |
+|---|---|---|
+| Python | 3.12 | Latest stable |
+| FastAPI | 0.111+ | Async API framework |
+| SQLAlchemy | 2.0 async | ORM with mapped_column() syntax |
+| TimescaleDB | Latest (PG16) | Time-series DB — hypertables + continuous aggregates |
+| Redis | 7+ | Celery broker + Pub/Sub event bus |
+| Celery | 5.3+ | Background task queue — separate from API process |
+| Pydantic | v2 | Typed schemas for every request/response |
+| Alembic | 1.13+ | Schema migrations |
+| yfinance | 0.2.38 | Market data fetching |
+| Anthropic SDK | Latest | Claude API for reports (V2 only) |
+| Langfuse | 2.x | LLM observability (V2 only) |
 
-### Model — `database/models/<entity>.py`
+### Frontend
+| Technology | Version | Why |
+|---|---|---|
+| React | 18 | Concurrent features |
+| TypeScript | 5.x | Strict mode, zero any types |
+| Vite | 5.x | Fast dev server on port 5173 |
+| TanStack Query | v5 | Server state — polls every 30s in V1 |
+| Zustand | 4.x | UI state only (selected ticker, open drawer) |
+| TailwindCSS + shadcn/ui | Latest | Accessible components |
+| Zod | 3.x | Runtime validation + type inference |
 
-- `SQLModel, table=True`, always `{"schema": "public"}`
-- UUID PK with both `default_factory=uuid.uuid4` and `server_default=func.gen_random_uuid()`
-- *(No `tenant_id` field — each tenant has its own database. Per-tenant isolation is handled at the DB level.)*
-- `created_at` / `updated_at` as `TIMESTAMP(timezone=True)` with `server_default=func.now()`
-- `to_dict()` method returning serialized dict — isoformat datetimes, `float()` numerics, `str()` UUIDs
+### Infrastructure
+| Technology | Why |
+|---|---|
+| Docker + Docker Compose | 6 containerised services |
+| Nginx | Reverse proxy for production |
+| GitHub Actions | CI: ruff + mypy + pytest + tsc |
+| Railway | Production deployment |
+
+---
+
+## The 6 Docker services
+
+| Service | Container | Role |
+|---|---|---|
+| timescaledb | finpulse_db | Database — stores all data |
+| redis | finpulse_redis | Task queue + event bus |
+| backend | finpulse_backend | FastAPI API on port 8000 |
+| worker | finpulse_worker | Celery worker — executes tasks |
+| beat | finpulse_beat | Celery Beat — fires tasks every 60s |
+| frontend | finpulse_frontend | React dev server on port 5173 |
+
+---
+
+## Database — 3 tables only
+
+### market_data
+One row per OHLCV candle. Composite PK (time, ticker).
+This is a TimescaleDB hypertable partitioned by day.
 
 ```python
-# Example pattern
-class Portfolio(SQLModel, table=True):
-    __tablename__ = "portfolios"
-    __table_args__ = {"schema": "public"}
-
-    id: UUID = Field(default_factory=uuid.uuid4, server_default=func.gen_random_uuid(), primary_key=True)
-    name: str
-    currency: str = "USD"
-    created_at: Optional[datetime] = Field(default=None, sa_column=Column(TIMESTAMP(timezone=True), server_default=func.now()))
-    updated_at: Optional[datetime] = Field(default=None, sa_column=Column(TIMESTAMP(timezone=True), server_default=func.now()))
-
-    def to_dict(self) -> dict:
-        return {
-            "id": str(self.id),
-            "name": self.name,
-            "currency": self.currency,
-            "created_at": self.created_at.isoformat() if self.created_at else None,
-            "updated_at": self.updated_at.isoformat() if self.updated_at else None,
-        }
+class MarketData(Base):
+    time: datetime          # PK with ticker
+    ticker: str             # PK with time — "TSLA" in V1
+    open: Decimal           # NUMERIC(12,4) — never FLOAT for prices
+    high: Decimal           # NUMERIC(12,4)
+    low: Decimal            # NUMERIC(12,4)
+    close: Decimal          # NUMERIC(12,4)
+    volume: int             # BigInteger
 ```
 
-### Store — `src/store/<entity>_store.py`
-
-- Extends `BaseStore`
-- No need to filter queries by `tenant_id` — each store instance operates on its own tenant's DB
-- Use `with self.get_session() as session:` — commits on exit, rolls back on exception, never manage transactions manually
-- Call `session.flush()` before `to_dict()` when you need DB-generated values after insert
-- `updated_at` doesn't auto-update — set it manually: `obj.updated_at = datetime.utcnow()`
-- Register the store in `PulseIqStore.__init__` (`src/store/pulseiq_store.py`) and `src/store/__init__.py`
-
-### Route — `src/api/routes/<entity>_routes.py`
-
-- Instantiate `PulseIqStore()` per request
-- Typed Pydantic request models with `Field(description=...)` on every parameter
-- Response shape: `{"status": "success", "data": rows, "count": len(rows)}` for lists; `{"status": "success", "data": {...}}` for single
-- 404s raise `HTTPException(status_code=404)`, not 500; all other exceptions log + raise 500
-- Register in `app.py`
-
-### Migrations — `database/migrations.py`
-
-Add to `run_migrations_for_tenant()`. All helpers in `database/migration_helpers.py` are idempotent (safe to re-run):
-`add_column`, `drop_column`, `create_index`, `create_unique_constraint`, `drop_unique_constraint`, `drop_table`, `execute_sql`.
-
-New tables don't need migration entries — created automatically from models on startup.
-
----
-
-## Agents
-
-Agents are LangGraph stateful graphs. Each agent has an orchestrator node that routes to domain worker nodes, which are then synthesized into a final response.
-
-### Agent IDs
+### anomalies
+One row per detected anomaly. Created by the detection worker.
 
 ```python
-AGENT_IDS = ["portfolio_analyst", "risk_analyst", "market_strategist", "trade_advisor"]
-
-# Pipeline agents (single node, no orchestration):
-_PIPELINE_AGENTS = {"market_strategist"}
+class Anomaly(Base):
+    id: UUID
+    detected_at: datetime
+    candle_time: datetime
+    ticker: str
+    type: AnomalyType       # "volume_spike" only in V1
+    severity: Severity      # LOW | MEDIUM | HIGH
+    zscore: float
+    iqr_flag: bool          # always False in V1
+    report_status: ReportStatus  # pending | completed | failed
 ```
 
-### Agent architecture
-
-```
-User Query
-  → Orchestrator Node  (LLM decides which workers to call and in what order)
-  → Batch Node         (runs tasks: sequential or parallel based on dependencies)
-  → Worker Nodes       (specialists: portfolio, risk, market_data, macro, alerts)
-  → Synthesizer Node   (assembles worker results into a cohesive response)
-  → Response (JSON or SSE)
-```
-
-### Worker domains
-
-| Worker | Owns |
-|--------|------|
-| `portfolio` | Holdings, positions, performance, allocation |
-| `risk` | VaR, drawdown, concentration risk, correlation |
-| `market_data` | Prices, OHLCV, volume, sector data |
-| `macro` | Macro indicators, yield curves, FX rates |
-| `alerts` | Threshold breaches, drift events, anomalies |
-| `execution` | Trade execution plans, order management |
-
-### Prompt loading convention
-
-All prompts live in `.txt` files — never inline in Python:
-
-```
-src/agents/prompts/<agent_id>.txt             — top-level agent system prompt
-src/agents/prompts/orchestration/<name>.txt   — orchestrator routing instructions
-src/agents/prompts/workers/<worker_id>.txt    — per-worker system prompt
-src/agents/prompts/tasks/<name>.txt           — one-off task prompts
-```
-
-Load with:
-```python
-load_agent_prompt(agent_id)           # → prompts/{agent_id}.txt
-load_orchestration_prompt(name)       # → prompts/orchestration/{name}.txt
-load_worker_prompt(worker_id)         # → prompts/workers/{worker_id}.txt
-load_task_prompt(name)                # → prompts/tasks/{name}.txt
-```
-
----
-
-## Skills (Tools)
-
-Tools are LangChain `@tool`-decorated functions. Each tool has a docstring with **USE WHEN** and **RETURNS** sections. Workers are given only the tools relevant to their domain.
-
-### Tool definition pattern
+### reports
+One row per AI report. One-to-one with anomaly.
 
 ```python
-from langchain_core.tools import tool
-from typing import Annotated, Optional, Dict, Any
-from src.utils.context import get_tenant_id
-
-@tool
-def get_portfolio_positions(
-    portfolio_id: Annotated[str, "UUID of the portfolio to fetch positions for"],
-    as_of_date: Annotated[Optional[str], "ISO date string; defaults to today if omitted"] = None,
-) -> Dict[str, Any]:
-    """
-    Fetch all open positions for a portfolio as of a given date.
-
-    USE WHEN: User asks about current holdings, position sizes, allocation breakdown,
-    or wants to know what's in a portfolio.
-
-    RETURNS: List of positions with ticker, quantity, cost_basis, current_value,
-    unrealized_pnl, weight_pct.
-    """
-    tenant_id = get_tenant_id()
-    store = PulseIqStore()
-    positions = store.positions.get_by_portfolio(portfolio_id, as_of_date=as_of_date)
-    return {"success": True, "data": [p.to_dict() for p in positions]}
-```
-
-### Tool categories
-
-| File | Tools |
-|------|-------|
-| `portfolio_tools.py` | `get_portfolio_positions`, `get_portfolio_performance`, `get_allocation_breakdown` |
-| `risk_tools.py` | `get_var_metrics`, `get_drawdown_stats`, `get_concentration_risk`, `get_correlation_matrix` |
-| `market_data_tools.py` | `get_price_history`, `get_ohlcv`, `get_sector_performance` |
-| `macro_tools.py` | `get_yield_curve`, `get_fx_rates`, `get_macro_indicators` |
-| `signal_tools.py` | `get_signals`, `get_signal_outcomes`, `update_signal_status` |
-| `alert_tools.py` | `get_active_alerts`, `acknowledge_alert`, `create_alert_rule` |
-| `artifact_tool.py` | `artifact_tool(action, artifact_type)` — creates reports, PDFs, Slack messages |
-| `flexible_query_tools.py` | `run_market_data_query` — custom data warehouse queries |
-
----
-
-## Multi-tenancy
-
-- One Postgres DB per tenant, managed by `database_orchestrator`
-- All table and model definitions are at the tenant DB level; tenant-specific data is fully isolated by database
-- Tenant config (LLM model, data sources, Keycloak, feature flags) in `tenantConfig.yml` locally, Vault in prod
-- Deep merge: default config → tenant-specific config; tenant values win
-- Tenant context propagated via Python `contextvars` (`set_tenant_id()` / `get_tenant_id()`) — never pass `tenant_id` through function args inside service/store/tool layers
-
----
-
-## Tenant config structure
-
-```yaml
-tenantConfig:
-  your-tenant-id:
-    tenantName: string
-    dataModel:
-      dbUrl: postgresql://user:pass@host:port/db
-    market_data_provider: alpaca | polygon | yfinance
-    llm_config:
-      default: gemini | openai | anthropic
-      gemini:
-        model: gemini-2.5-pro
-        temperature: 0.0
-    keycloakConfig:
-      realmName: string
-      clientId: string
-      clientSecret: string
-    agents: portfolio_analyst,risk_analyst,market_strategist,trade_advisor
-    pulseiq:
-      intelligence_layer: true
+class Report(Base):
+    id: UUID
+    anomaly_id: UUID        # FK to anomalies.id, unique
+    summary: str
+    reasons: list           # JSONB array of strings
+    risk_level: str
+    confidence: float
+    tokens_used: int        # 0 in V1 (mock)
+    latency_ms: int
+    created_at: datetime
 ```
 
 ---
 
-## Standards
+## Non-negotiable rules
 
-- Follow the CRUD pattern above — no one-off implementations
-- Typed Pydantic request models with `Field(description=...)` on every route parameter
-- Meaningful log messages with context: `logger.error(f"[portfolio] failed to fetch positions: {e}", exc_info=True)`
-- No silent exception swallowing in stores — let them bubble to the route handler
-- No dead code, no commented-out blocks
-- Type hints throughout (`Optional`, `Dict`, `List`, etc. from `typing`)
-- Tools must be data-grounded: every claim in an agent response must come from a tool result, not LLM knowledge
-- Prompts live in `.txt` files only — never inline system prompts in Python
-- All financial numbers stored as `Numeric(precision, scale)` in Postgres — never `float` for money/prices
+### Backend rules
+
+**1. No database calls in services.**
+`services/detector.py` and `services/reporter.py` are pure business logic. They receive
+data as arguments and return results. They never import or call any repository.
+
+**2. No business logic in repositories.**
+Repositories contain SQL queries only. They return rows. They do not decide what the
+results mean.
+
+**3. No business logic in route handlers.**
+Route handlers validate input, call a repository, and return a response schema. If a
+handler is longer than 20 lines it is a code smell.
+
+**4. Every route returns a typed Pydantic response model.**
+No route handler returns a raw dict. Every response is declared with `response_model=`.
+
+**5. NUMERIC not FLOAT for all price fields.**
+`NUMERIC(12,4)` in DB. `Decimal` in Python. Float arithmetic errors in financial data
+are a real production bug. Non-negotiable.
+
+**6. All background work runs in Celery workers.**
+Never use `asyncio.create_task()` for ingestion, detection, or report generation.
+Celery workers are the correct and only place for this work.
+
+**7. Celery tasks must be idempotent.**
+Upsert with `ON CONFLICT DO NOTHING`. Check if a report already exists before generating.
+Every task can be safely retried.
+
+**8. Never commit credentials.**
+`.env` is in `.gitignore`. All credentials go in `.env` locally and Railway dashboard
+in production. `.env.example` documents every key — never a real value.
+
+### Frontend rules
+
+**9. TypeScript types come from Zod only.**
+`lib/schemas.ts` is the single source of truth. Types are `z.infer<typeof Schema>`.
+Never write a TypeScript interface that duplicates a Zod schema.
+
+**10. Server state in TanStack Query. UI state in Zustand. Never mixed.**
+Anomaly list = server state → TanStack Query with `refetchInterval: 30000`.
+Selected ticker, open drawer = UI state → Zustand.
+
+**11. No `any` type anywhere.**
+If `any` seems necessary, write a Zod schema for that shape instead.
+
+**12. shadcn components live in `components/ui/` and are never modified.**
+Extend in a wrapper component in `components/`. Never edit generated shadcn files.
+
+**13. Every API response is Zod-validated before use.**
+The axios interceptor in `lib/api.ts` runs Zod parse on every response. Do not bypass
+this by calling `axios.get()` directly — always use the `api` instance.
+
+---
+
+## Data flow — V1
+
+### Every 60 seconds
+```
+Beat
+→ drops ingest_market_data task into Redis queue
+→ Worker picks up task
+→ yfinance.download(["TSLA"], interval="1m", period="1d")
+→ parse DataFrame (columns are (field, ticker) — NOT (ticker, field))
+→ filter: only candles newer than last_ingested_time
+→ drop NaN volume rows
+→ upsert into market_data (ON CONFLICT (time, ticker) DO NOTHING)
+→ chain: detect_anomalies.si("TSLA")
+```
+
+### Detection (chained after ingestion)
+```
+Worker
+→ query rolling stats from market_data (last 20 candles)
+→ get latest candle
+→ zscore = (current_volume - mean) / std
+→ if zscore < 2.5: no anomaly, stop
+→ if zscore 2.5–3.5: severity = MEDIUM
+→ if zscore > 3.5: severity = HIGH
+→ write anomaly to DB (report_status = "pending")
+→ chain: generate_report.si(anomaly_id)
+```
+
+### Report generation — V1 mock
+```
+Worker
+→ check if report already exists (idempotency)
+→ USE_MOCK_REPORTS=true: return hardcoded ReportSchema immediately
+→ write to reports table
+→ update anomaly.report_status = "completed"
+```
+
+### Frontend — V1 polling
+```
+React (TanStack Query, every 30 seconds)
+→ GET /api/v1/anomalies
+→ Backend queries anomalies table
+→ Returns JSON
+→ Zod validates response
+→ AnomalyFeed re-renders with new cards
+
+User clicks anomaly card
+→ GET /api/v1/reports/{anomaly_id}
+→ Backend queries reports table
+→ Returns completed report JSON
+→ ReportDrawer renders summary + reasons
+```
+
+---
+
+## Anomaly detection logic — V1
+
+Only Z-score. No IQR in V1.
+
+```python
+# Rolling stats from last 20 candles
+mean_volume = avg(last_20_candles.volume)
+std_volume  = stddev(last_20_candles.volume)
+
+# Z-score on current candle
+zscore = (current_volume - mean_volume) / std_volume
+
+# Severity — V1 (Z-score only)
+if zscore > 3.5:   severity = HIGH
+if zscore > 2.5:   severity = MEDIUM
+if zscore <= 2.5:  no anomaly
+```
+
+Minimum candles required before detection runs: 20.
+If fewer than 20 candles exist in DB for TSLA, skip detection entirely.
+
+**V2 additions (do not implement in V1):**
+- IQR price swing detection
+- Two-signal severity matrix
+- WebSocket broadcast after anomaly creation
+- Real Claude API report generation
+- Langfuse tracing
+
+---
+
+## API contracts
+
+### GET /api/v1/stocks/{ticker}/candles
+Query: `interval=1m|5m|15m`, `hours=1-168`, `cursor?`
+```json
+{
+  "data": [{"time": 1713000000, "open": "182.50", "high": "183.10",
+             "low": "182.20", "close": "182.90", "volume": 1250000}],
+  "next_cursor": "ISO8601|null",
+  "has_more": true,
+  "ticker": "TSLA"
+}
+```
+
+### GET /api/v1/anomalies
+Query: `ticker?`, `severity?`, `type?`, `hours=1-168`, `cursor?`
+```json
+{
+  "data": [{
+    "id": "uuid",
+    "detected_at": "ISO8601",
+    "candle_time": "ISO8601",
+    "ticker": "TSLA",
+    "type": "volume_spike",
+    "severity": "HIGH",
+    "zscore": 4.23,
+    "iqr_flag": false,
+    "report_status": "completed"
+  }],
+  "next_cursor": "uuid|null",
+  "has_more": false
+}
+```
+
+### GET /api/v1/reports/{anomaly_id}
+```json
+// 200 completed
+{"id": "uuid", "anomaly_id": "uuid", "summary": "string",
+ "reasons": ["string"], "risk_level": "High",
+ "confidence": 0.91, "tokens_used": 0, "latency_ms": 12,
+ "created_at": "ISO8601"}
+
+// 202 pending
+{"status": "pending", "estimated_ready_at": "ISO8601"}
+
+// 200 failed
+{"status": "failed", "error": "generation_failed"}
+
+// 404
+{"error": "report_not_found"}
+```
+
+### GET /api/v1/health
+```json
+{"status": "healthy", "db": "ok", "redis": "ok",
+ "last_ingestion": "ISO8601", "anomalies_24h": 3}
+```
+
+---
+
+## Environment variables
+
+All variables defined in `backend/app/config.py` using pydantic-settings.
+App fails loudly on startup if any required variable is missing.
+
+```
+# Database (TimescaleDB)
+DB_HOST=localhost
+DB_PORT=5432
+DB_NAME=finpulse
+DB_USER=postgres
+DB_PASSWORD=
+
+# Redis
+REDIS_URL=redis://localhost:6379/0
+
+# AI (V2 only — stub values fine for V1)
+ANTHROPIC_API_KEY=sk-ant-...
+LANGFUSE_PUBLIC_KEY=pk-lf-...
+LANGFUSE_SECRET_KEY=sk-lf-...
+LANGFUSE_HOST=https://cloud.langfuse.com
+
+# App
+TICKERS=TSLA
+ANOMALY_ZSCORE_THRESHOLD=2.5
+USE_MOCK_REPORTS=true
+BACKEND_URL=http://localhost:8000
+
+# Frontend
+VITE_API_BASE_URL=http://localhost:8000
+VITE_WS_URL=ws://localhost:8000/api/v1/ws
+```
+
+---
+
+## TimescaleDB specifics
+
+**Alembic does not handle hypertables or continuous aggregates.**
+Alembic manages regular DDL only. After running migrations, these must be run manually:
+
+```sql
+-- Convert market_data to hypertable (run once after first migration)
+SELECT create_hypertable('market_data', 'time', chunk_time_interval => INTERVAL '1 day');
+
+-- In V1, rolling stats are computed from raw rows (no continuous aggregate yet)
+-- V2 adds: CREATE MATERIALIZED VIEW market_data_stats WITH (timescaledb.continuous)
+```
+
+**Use NUMERIC(12,4) for all price columns.**
+SQLAlchemy type: `Numeric(12, 4)`. Python type: `Decimal`.
+Floats introduce rounding errors in financial calculations. Non-negotiable.
+
+**After seeding historical data, refresh manually:**
+```sql
+-- V2 only (after continuous aggregate exists)
+CALL refresh_continuous_aggregate('market_data_stats', NULL, NULL);
+```
+
+---
+
+## Common commands
+
+```bash
+make dev            # Start all 6 Docker services (detached)
+make down           # Stop all services
+make logs           # Tail all service logs
+make build          # Build all Docker images
+
+make migrate        # alembic upgrade head
+make migration      # alembic revision --autogenerate -m "description"
+make db             # Open psql in TimescaleDB container
+make redis-cli      # Open redis-cli in Redis container
+
+make test           # pytest + tsc --noEmit
+make lint           # ruff + mypy + tsc --noEmit
+make shell          # Python shell in backend container
+```
+
+---
+
+## Failure modes
+
+| What fails | Defined behaviour |
+|---|---|
+| yfinance unavailable | Celery retries 3x (30s, 60s, 120s backoff). Dashboard shows stale data — no crash. |
+| Detection with < 20 candles | Skip silently. Log a debug message. Do not write a failed anomaly. |
+| Report task fails | Set anomaly.report_status = "failed". Frontend shows "Report unavailable". Never a blank screen. |
+| TimescaleDB slow query | Log warning if query exceeds 500ms. |
+
+---
+
+## Testing expectations
+
+### Must be tested
+- All `services/detector.py` functions — minimum 8 test cases:
+  normal data, clear spike, borderline below threshold, borderline above threshold,
+  fewer than 20 candles (should skip), all identical volumes (std=0, no divide by zero),
+  extreme outlier, HIGH vs MEDIUM boundary
+- All repository methods — against a real test database, not mocks
+- API endpoints — using `httpx.AsyncClient` with test database
+
+### Does not need tests (V1)
+- Celery task wiring (tested via service + repo unit tests)
+- MCP server (V2)
+
+### Running tests
+```bash
+make test                              # all tests
+pytest tests/test_detector.py -v      # detector unit tests only
+pytest tests/ -v -s                   # with print output
+cd frontend && tsc --noEmit           # frontend types only
+```
+
+---
+
+## What this demonstrates to hiring managers
+
+1. **Celery + Redis for background work** — process isolation, API never blocks
+2. **TimescaleDB** — time-series thinking, not just "I used Postgres"
+3. **Repository pattern** — DB logic in one layer, services are pure business logic
+4. **Zod as single source of truth** — type drift prevention at API boundary
+5. **Statistical anomaly detection** — Z-score with mathematical reasoning
+6. **Defined failure modes** — every component has documented behaviour when it fails
+
+Be ready to explain every decision above out loud in an interview.
+The ARCHITECTURE.md file has full reasoning for each choice.
