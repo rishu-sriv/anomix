@@ -19,7 +19,7 @@ from app.repositories.anomaly_repo import AnomalyRepo
 from app.repositories.market_repo import MarketRepo
 from app.repositories.report_repo import ReportRepo
 
-pytestmark = pytest.mark.asyncio
+pytestmark = pytest.mark.asyncio(loop_scope="session")
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
