@@ -5,8 +5,9 @@ Strategy:
 - A session-scoped `test_engine` creates the `finpulse_test` database once,
   builds all tables from SQLAlchemy metadata, and converts market_data to a
   hypertable.  Dropped at the end of the test session.
-- A function-scoped `db_session` wraps each test in a transaction that is
-  rolled back after the test, keeping tests fully isolated from each other.
+- A function-scoped `db_session` binds each test to a dedicated connection
+  whose transaction is rolled back after the test, keeping tests fully
+  isolated from each other and from the shared connection pool.
 """
 
 import asyncio
@@ -17,7 +18,6 @@ import pytest_asyncio
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import (
     AsyncSession,
-    async_sessionmaker,
     create_async_engine,
 )
 
@@ -26,13 +26,11 @@ from app.models import Base
 TEST_DB_NAME = "finpulse_test"
 
 
-# ── Event loop (session-scoped so async fixtures can share it) ────────────
+# ── Event loop (session-scoped so all fixtures and tests share one loop) ──
 
 @pytest.fixture(scope="session")
-def event_loop():
-    loop = asyncio.new_event_loop()
-    yield loop
-    loop.close()
+def event_loop_policy():
+    return asyncio.DefaultEventLoopPolicy()
 
 
 # ── Test database (created once per session, dropped on teardown) ─────────
@@ -79,17 +77,22 @@ async def test_engine():
     await admin_engine.dispose()
 
 
-# ── Per-test session with rollback isolation ──────────────────────────────
+# ── Per-test session bound to a dedicated connection ──────────────────────
 
-@pytest_asyncio.fixture
+@pytest_asyncio.fixture(scope="function")
 async def db_session(test_engine) -> AsyncGenerator[AsyncSession, None]:
     """
-    Each test gets a fresh AsyncSession.  The session is rolled back after
-    the test so no data leaks between tests.
+    Each test gets its own connection with an open transaction.
+    The transaction is rolled back after the test — no data leaks between tests.
+
+    Binding AsyncSession directly to a Connection (rather than the engine pool)
+    ensures asyncpg never sees two operations in flight on the same connection.
     """
-    session_factory = async_sessionmaker(
-        test_engine, class_=AsyncSession, expire_on_commit=False
-    )
-    async with session_factory() as session:
-        yield session
-        await session.rollback()
+    async with test_engine.connect() as conn:
+        await conn.begin()
+        async_session = AsyncSession(bind=conn, expire_on_commit=False)
+        try:
+            yield async_session
+        finally:
+            await async_session.close()
+            await conn.rollback()
