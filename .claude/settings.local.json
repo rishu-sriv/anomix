@@ -28,7 +28,19 @@
       "Bash(cat)",
       "Read(//tmp/**)",
       "Bash(pip install:*)",
-      "Bash(grep -E \"\\\\.\\(py\\)$\")"
+      "Bash(grep -E \"\\\\.\\(py\\)$\")",
+      "Bash(wc:*)",
+      "Bash(grep -l \"def test_\" /Users/rishu/Desktop/FinPulse/backend/tests/*.py)",
+      "Bash(lsof -i :5432 -sTCP:LISTEN)",
+      "Bash(docker stop project2-nginx-1:*)",
+      "Bash(curl -s http://localhost:8000/api/v1/health)",
+      "Bash(curl -s -o /dev/null -w \"%{http_code}\" -H \"Origin: http://localhost:5173\" http://localhost:8000/api/v1/anomalies?hours=24)",
+      "Bash(curl -s -I -H \"Origin: http://localhost:5173\" http://localhost:8000/api/v1/health)",
+      "Bash(curl -s -o /dev/null -w \"%{http_code}\" -H \"Origin: http://localhost:5173\" \"http://localhost:8000/api/v1/anomalies?hours=24\")",
+      "Bash(curl -sv -H \"Origin: http://localhost:5173\" \"http://localhost:8000/api/v1/health\")",
+      "Bash(docker exec finpulse_backend:*)",
+      "Bash(docker exec finpulse_db:*)",
+      "Bash(docker restart finpulse_beat:*)"
     ]
   }
 }
