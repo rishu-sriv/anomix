@@ -38,4 +38,9 @@ app.conf.beat_schedule = {
         "schedule": 60.0,
         "args": ("TSLA",),
     },
+    "ingest-btcusd-every-60s": {
+        "task": "workers.ingestion_task.ingest_market_data",
+        "schedule": 60.0,
+        "args": ("BTC-USD",),
+    },
 }
