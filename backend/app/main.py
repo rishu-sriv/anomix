@@ -10,6 +10,7 @@ from contextlib import asynccontextmanager
 from collections.abc import AsyncGenerator
 
 from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
 
 from app.api.v1.router import router as v1_router
 from app.core.database import engine
@@ -26,5 +27,12 @@ async def lifespan(application: FastAPI) -> AsyncGenerator[None, None]:
 
 
 app = FastAPI(title="FinPulse API", version="1.0.0", lifespan=lifespan)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["http://localhost:5173", "http://127.0.0.1:5173"],
+    allow_methods=["GET", "POST"],
+    allow_headers=["*"],
+)
 
 app.include_router(v1_router)
