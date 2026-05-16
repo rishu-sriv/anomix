@@ -91,9 +91,9 @@ jobs:
         working-directory: backend
         run: pytest tests/ -v --tb=short
 
-  # ─── Frontend type check ─────────────────────────────────────
+  # ─── Frontend type check + lint ──────────────────────────────
   typescript:
-    name: Frontend types (tsc)
+    name: Frontend types (tsc) + lint (eslint)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -108,3 +108,6 @@ jobs:
       - name: Type check
         working-directory: frontend
         run: npx tsc --noEmit
+      - name: Lint
+        working-directory: frontend
+        run: npm run lint
