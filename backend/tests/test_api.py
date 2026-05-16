@@ -203,6 +203,20 @@ async def test_anomalies_filter_by_severity(
     assert body["data"][0]["severity"] == "HIGH"
 
 
+async def test_anomalies_filter_by_ticker(
+    client: httpx.AsyncClient, db_session: AsyncSession
+) -> None:
+    await AnomalyRepo.create(db_session, _anomaly_data(ticker="TSLA"))
+    await AnomalyRepo.create(db_session, _anomaly_data(ticker="AAPL"))
+    await db_session.flush()
+
+    resp = await client.get("/api/v1/anomalies", params={"ticker": "TSLA"})
+    assert resp.status_code == 200
+    body = resp.json()
+    assert len(body["data"]) == 1
+    assert body["data"][0]["ticker"] == "TSLA"
+
+
 # ── Reports ───────────────────────────────────────────────────────────────────
 
 

@@ -7,12 +7,15 @@ Strategy:
   hypertable.  Dropped at the end of the test session.
 - A function-scoped `db_session` wraps each test in a transaction that is
   rolled back after the test, keeping tests fully isolated from each other.
+
+Event loop:
+  asyncio_mode = auto  +  asyncio_default_fixture_loop_scope = session
+  in pytest.ini mean all async fixtures share a single session-scoped event
+  loop automatically — no manual event_loop fixture needed.
 """
 
-import asyncio
 from collections.abc import AsyncGenerator
 
-import pytest
 import pytest_asyncio
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import (
@@ -24,15 +27,6 @@ from sqlalchemy.ext.asyncio import (
 from app.models import Base
 
 TEST_DB_NAME = "finpulse_test"
-
-
-# ── Event loop (session-scoped so async fixtures can share it) ────────────
-
-@pytest.fixture(scope="session")
-def event_loop():
-    loop = asyncio.new_event_loop()
-    yield loop
-    loop.close()
 
 
 # ── Test database (created once per session, dropped on teardown) ─────────
