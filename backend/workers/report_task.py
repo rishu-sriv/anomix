@@ -6,10 +6,11 @@ Called by: detection_task.detect_anomalies (chained after anomaly creation)
 Flow:
   1. Fetch the Anomaly row from DB
   2. Check if a Report already exists — if yes, stop (idempotency)
-  3. Fetch rolling stats + recent candles (passed to reporter for V2 compatibility)
-  4. Call generate_report() — returns a mock ReportSchema in V1
+  3. Fetch rolling stats + recent candles (passed to reporter for context)
+  4. Call generate_report() — real Claude API call (or mock when USE_MOCK_REPORTS=true)
   5. Write Report row, update anomaly.report_status = completed
-  6. On any exception: set anomaly.report_status = failed
+  6. Publish report_ready event to Redis (best-effort — failure does not fail the task)
+  7. On any exception in steps 4-5: set anomaly.report_status = failed
 
 Idempotency:
   ReportRepo.get_by_anomaly_id() check ensures we never write two reports for
@@ -19,9 +20,11 @@ Idempotency:
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import uuid
 
+import redis.asyncio as aioredis
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
 from app.config import settings
@@ -43,6 +46,7 @@ async def _generate(anomaly_id_str: str) -> None:
     Generate and persist a report for the given anomaly.
 
     Sets report_status=failed on the anomaly if report generation raises.
+    Publishes a report_ready event to Redis after a successful write.
     """
     engine = create_async_engine(settings.async_database_url, echo=False)
     try:
@@ -61,7 +65,7 @@ async def _generate(anomaly_id_str: str) -> None:
                 logger.info("Report already exists for anomaly %s — skipping", anomaly_id)
                 return
 
-            # Fetch context for the reporter (not used in V1 mock, required for V2)
+            # Fetch context for the reporter
             stats = await MarketRepo.get_rolling_stats(session, anomaly.ticker)
             candles, _ = await MarketRepo.get_candles(session, anomaly.ticker, hours=1)
 
@@ -86,10 +90,22 @@ async def _generate(anomaly_id_str: str) -> None:
                     session, anomaly_id, ReportStatus.completed
                 )
                 await session.commit()
+
                 logger.info(
-                    "Report generated for anomaly %s (latency=%dms)",
+                    "Report generated for anomaly %s (latency=%dms tokens=%d)",
                     anomaly_id,
                     report_schema.latency_ms,
+                    report_schema.tokens_used,
+                )
+
+                # ── Publish report_ready event (best-effort) ──────────────────
+                # Failure here is non-fatal — the report is already persisted.
+                # Downstream consumers (e.g. WebSocket broadcast in V2) listen
+                # to this channel to push notifications to connected clients.
+                await _publish_report_ready(
+                    anomaly_id_str,
+                    anomaly.ticker,
+                    anomaly.severity.value,
                 )
 
             except Exception as report_exc:
@@ -106,6 +122,39 @@ async def _generate(anomaly_id_str: str) -> None:
                 raise
     finally:
         await engine.dispose()
+
+
+async def _publish_report_ready(
+    anomaly_id_str: str,
+    ticker: str,
+    severity: str,
+) -> None:
+    """
+    Publish a report_ready event to the Redis finpulse:reports channel.
+
+    Creates a short-lived Redis connection for the publish and closes it immediately.
+    Any exception is logged but not re-raised — Redis availability must not affect
+    report persistence.
+    """
+    try:
+        redis_client = aioredis.from_url(settings.redis_url, decode_responses=True)
+        payload = json.dumps(
+            {
+                "anomaly_id": anomaly_id_str,
+                "status": "ready",
+                "ticker": ticker,
+                "severity": severity,
+            }
+        )
+        await redis_client.publish("finpulse:reports", payload)
+        await redis_client.aclose()
+        logger.debug("Published report_ready for anomaly %s", anomaly_id_str)
+    except Exception as exc:
+        logger.warning(
+            "Failed to publish report_ready for anomaly %s: %s — report is persisted, continuing",
+            anomaly_id_str,
+            exc,
+        )
 
 
 # ── Celery task ───────────────────────────────────────────────────────────────

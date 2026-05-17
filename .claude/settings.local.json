@@ -40,7 +40,17 @@
       "Bash(curl -sv -H \"Origin: http://localhost:5173\" \"http://localhost:8000/api/v1/health\")",
       "Bash(docker exec finpulse_backend:*)",
       "Bash(docker exec finpulse_db:*)",
-      "Bash(docker restart finpulse_beat:*)"
+      "Bash(docker restart finpulse_beat:*)",
+      "Bash(pip show:*)",
+      "Bash(ls /Users/rishu/Desktop/FinPulse/backend/.env*)",
+      "Bash(ls /Users/rishu/Desktop/FinPulse/.env*)",
+      "Bash(ln -sf /Users/rishu/Desktop/FinPulse/.env /Users/rishu/Desktop/FinPulse/backend/.env)",
+      "Bash(pg_isready)",
+      "Bash(brew services:*)",
+      "Bash(open -a Docker)",
+      "Bash(docker info:*)",
+      "Bash(docker port:*)",
+      "Bash(pip index:*)"
     ]
   }
 }

@@ -12,11 +12,13 @@ Endpoints covered:
   GET /api/v1/health
   GET /api/v1/stocks/{ticker}/candles
   GET /api/v1/anomalies
-  GET /api/v1/reports/{anomaly_id}  — 404, 202 (pending), 200 (completed)
+  GET /api/v1/reports/{anomaly_id}         — 404, 202 (pending), 200 (completed)
+  GET /api/v1/reports/{anomaly_id}/stream  — SSE: 404, pseudo-stream, mock-mode stream
 """
 
 from __future__ import annotations
 
+import json
 import uuid
 from datetime import datetime, timezone
 from decimal import Decimal
@@ -274,3 +276,99 @@ async def test_report_200_failed(
     body = resp.json()
     assert body["status"] == "failed"
     assert body["error"] == "generation_failed"
+
+
+# ── SSE streaming endpoint (/reports/{id}/stream) ─────────────────────────────
+
+
+def _parse_sse_events(raw_text: str) -> list[dict]:
+    """Extract JSON payloads from raw SSE response text (data: ... lines)."""
+    events = []
+    for line in raw_text.splitlines():
+        if line.startswith("data: "):
+            events.append(json.loads(line[6:]))
+    return events
+
+
+async def test_stream_report_404_for_nonexistent_anomaly(client: httpx.AsyncClient) -> None:
+    fake_id = uuid.uuid4()
+    resp = await client.get(f"/api/v1/reports/{fake_id}/stream")
+    assert resp.status_code == 404
+    assert resp.json()["error"] == "report_not_found"
+
+
+async def test_stream_report_pseudo_streams_completed_report(
+    client: httpx.AsyncClient, db_session: AsyncSession
+) -> None:
+    """Completed report is pseudo-streamed word-by-word + final done event."""
+    anomaly = await AnomalyRepo.create(
+        db_session, _anomaly_data(report_status=ReportStatus.completed)
+    )
+    report = await ReportRepo.create(db_session, _report_data(anomaly.id))
+    await db_session.flush()
+
+    resp = await client.get(f"/api/v1/reports/{anomaly.id}/stream")
+    assert resp.status_code == 200
+    assert "text/event-stream" in resp.headers["content-type"]
+
+    events = _parse_sse_events(resp.text)
+    assert len(events) > 0
+
+    # All but the last are token events
+    token_events = [e for e in events if "token" in e]
+    assert len(token_events) > 0
+    # Tokens must reconstruct the summary (ignoring trailing spaces)
+    reconstructed = "".join(e["token"] for e in token_events).strip()
+    assert reconstructed == report.summary.strip()
+
+    # Last event is the done event
+    done_events = [e for e in events if e.get("done") is True]
+    assert len(done_events) == 1
+    assert "report" in done_events[0]
+    assert done_events[0]["report"]["id"] == str(report.id)
+
+
+async def test_stream_report_mock_mode_streams_and_returns_done(
+    client: httpx.AsyncClient, db_session: AsyncSession
+) -> None:
+    """Pending anomaly with USE_MOCK_REPORTS=true: mock report is pseudo-streamed."""
+    anomaly = await AnomalyRepo.create(
+        db_session, _anomaly_data(report_status=ReportStatus.pending)
+    )
+    await db_session.flush()
+
+    # settings.use_mock_reports defaults to True in the test environment
+    resp = await client.get(f"/api/v1/reports/{anomaly.id}/stream")
+    assert resp.status_code == 200
+
+    events = _parse_sse_events(resp.text)
+    token_events = [e for e in events if "token" in e]
+    done_events = [e for e in events if e.get("done") is True]
+
+    assert len(token_events) > 0
+    assert len(done_events) == 1
+    assert "report" in done_events[0]
+    # Mock report has no real tokens_used
+    assert done_events[0]["report"]["tokens_used"] == 0
+
+
+async def test_stream_report_done_event_contains_full_report_shape(
+    client: httpx.AsyncClient, db_session: AsyncSession
+) -> None:
+    """done event report payload must contain all ReportSchema fields."""
+    anomaly = await AnomalyRepo.create(
+        db_session, _anomaly_data(report_status=ReportStatus.completed)
+    )
+    await ReportRepo.create(db_session, _report_data(anomaly.id))
+    await db_session.flush()
+
+    resp = await client.get(f"/api/v1/reports/{anomaly.id}/stream")
+    events = _parse_sse_events(resp.text)
+    done = next(e for e in events if e.get("done") is True)
+
+    report = done["report"]
+    required_fields = {"id", "anomaly_id", "summary", "reasons", "risk_level", "confidence",
+                       "tokens_used", "latency_ms", "created_at"}
+    assert required_fields.issubset(set(report.keys()))
+    assert isinstance(report["reasons"], list)
+    assert len(report["reasons"]) >= 1
