@@ -1,0 +1,5 @@
+mcp>=1.0.0
+sqlalchemy==2.0.30
+asyncpg==0.29.0
+pydantic-settings==2.2.1
+python-dotenv>=1.0.0

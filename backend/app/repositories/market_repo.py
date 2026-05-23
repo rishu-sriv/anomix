@@ -115,3 +115,21 @@ class MarketRepo:
         )
         result = await session.execute(stmt)
         return result.scalar_one_or_none()
+
+    @staticmethod
+    async def get_recent_closes(
+        session: AsyncSession, ticker: str, limit: int = 20
+    ) -> list[float]:
+        """
+        Return the last `limit` close prices for `ticker`, newest first.
+        Used by the IQR detector — computes IQR in Python for consistency
+        with unit tests (same code path as production, unlike a SQL aggregate).
+        """
+        stmt = (
+            select(MarketData.close)
+            .where(MarketData.ticker == ticker)
+            .order_by(MarketData.time.desc())
+            .limit(limit)
+        )
+        result = await session.execute(stmt)
+        return [float(row) for row in result.scalars().all()]

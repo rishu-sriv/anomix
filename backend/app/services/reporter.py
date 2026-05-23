@@ -97,6 +97,7 @@ _MODEL = "claude-haiku-4-5-20251001"
 def _build_prompt(anomaly: Anomaly, candles: list, stats: RollingStats) -> str:
     """Build the user-turn prompt from anomaly context, candle data, and rolling stats."""
     zscore_str = f"{anomaly.zscore:.2f}" if anomaly.zscore is not None else "N/A"
+    iqr_str = "yes" if anomaly.iqr_flag else "no"
 
     candle_ctx = ""
     if candles:
@@ -117,7 +118,8 @@ def _build_prompt(anomaly: Anomaly, candles: list, stats: RollingStats) -> str:
         f"Anomaly detected for {anomaly.ticker} at {anomaly.detected_at.isoformat()}.\n"
         f"Anomaly type:  {anomaly.type.value}\n"
         f"Severity:      {anomaly.severity.value}\n"
-        f"Z-score:       {zscore_str}"
+        f"Z-score:       {zscore_str}\n"
+        f"IQR price swing detected: {iqr_str}"
         f"{candle_ctx}"
         f"{stats_ctx}\n\n"
         "Generate a financial analysis report for this market anomaly."

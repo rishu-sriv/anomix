@@ -1,12 +1,15 @@
 /**
- * TanStack Query hook for the anomalies list.
+ * TanStack Query hook for the anomalies list — V2: useInfiniteQuery with cursor pagination.
  *
- * Polls every 30 seconds (V1 spec). Zod validates the response before
- * it enters the React render cycle — type errors surface at the boundary,
- * not deep in components.
+ * Polls every 30 seconds as a safety net (WebSocket invalidates immediately on new anomalies).
+ * Zod validates every page response before it enters the React render cycle.
+ *
+ * Pagination: keyset cursor (UUID of last anomaly in previous page).
+ * TanStack Query v5 refetches only the first page on interval/invalidation —
+ * new anomalies appear at the top; deeper pages remain cached.
  */
 
-import { useQuery } from "@tanstack/react-query"
+import { useInfiniteQuery } from "@tanstack/react-query"
 import { api } from "@/lib/api"
 import { AnomalyListResponseSchema, type AnomalyListResponse } from "@/lib/schemas"
 
@@ -19,17 +22,21 @@ interface UseAnomaliesOptions {
 export function useAnomalies(options: UseAnomaliesOptions = {}) {
   const { ticker, severity, hours = 24 } = options
 
-  return useQuery<AnomalyListResponse, Error>({
+  return useInfiniteQuery<AnomalyListResponse, Error>({
     queryKey: ["anomalies", { ticker, severity, hours }],
-    queryFn: async () => {
+    queryFn: async ({ pageParam }) => {
       const params: Record<string, string | number> = { hours }
       if (ticker) params.ticker = ticker
       if (severity) params.severity = severity
+      if (pageParam) params.cursor = pageParam as string
 
       const { data } = await api.get("/anomalies", { params })
       return AnomalyListResponseSchema.parse(data)
     },
-    // Poll every 30 seconds — V1 polling strategy (no WebSocket yet)
+    initialPageParam: undefined as string | undefined,
+    getNextPageParam: (lastPage) => lastPage.next_cursor ?? undefined,
+    // Poll every 30 seconds — fallback when WebSocket is disconnected.
+    // On WS reconnect/message, queryClient.invalidateQueries fires immediately.
     refetchInterval: 30_000,
   })
 }
