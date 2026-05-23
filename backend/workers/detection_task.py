@@ -1,19 +1,22 @@
 """
-Detection task — runs Z-score anomaly detection on the latest TSLA candle.
+Detection task — runs combined anomaly detection (Z-score + IQR) on the latest candle.
 
 Called by: ingestion_task.ingest_market_data (chained, only when new candles inserted)
 
 Flow:
-  1. Fetch rolling stats (mean, std, count) from last 20 candles in market_data
-  2. Fetch the most recent candle
-  3. Run run_detection(volume, stats) — pure function, no DB calls
-  4. If anomaly: write Anomaly row with report_status=pending
-  5. Chain generate_report(anomaly_id)
-  6. If no anomaly or < 20 candles: log and stop
+  1. Fetch rolling volume stats (mean, std, count) from last 20 candles
+  2. Fetch last 20 close prices for IQR computation
+  3. Fetch the most recent candle
+  4. Run run_combined_detection(volume, close, stats, closes) — pure, no DB calls
+  5. If anomaly: write Anomaly row with report_status=pending
+     - type=volume_spike if Z-score fired (with or without IQR)
+     - type=price_swing if IQR-only (no Z-score signal)
+  6. Chain generate_report(anomaly_id)
+  7. If no anomaly or < 20 candles: log and stop
 
-Idempotency: on retry, detection re-runs on the same latest candle. This may
-create a duplicate anomaly row for the same candle. Acceptable in V1 — a
-unique constraint on (candle_time, ticker) would prevent this in V2.
+Idempotency: duplicate detection on the same candle is prevented by the unique
+constraint on (candle_time, ticker) in anomalies. IntegrityError is caught and
+logged — no retry on duplicate.
 """
 
 from __future__ import annotations
@@ -23,13 +26,14 @@ import logging
 import uuid
 from datetime import datetime, timezone
 
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
 from app.config import settings
 from app.models.anomaly import AnomalyType, ReportStatus, Severity
 from app.repositories.anomaly_repo import AnomalyRepo
 from app.repositories.market_repo import MarketRepo
-from app.services.detector import run_detection
+from app.services.detector import run_combined_detection
 from workers.celery_app import app
 
 logger = logging.getLogger(__name__)
@@ -40,15 +44,16 @@ logger = logging.getLogger(__name__)
 
 async def _detect(ticker: str) -> str | None:
     """
-    Run detection and write an Anomaly row if triggered.
+    Run combined detection and write an Anomaly row if triggered.
     Returns the anomaly UUID string, or None if no anomaly was detected.
     """
     engine = create_async_engine(settings.async_database_url, echo=False)
     try:
         factory = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
         async with factory() as session:
-            # Rolling stats from the last 20 candles (as per V1 spec)
+            # Fetch rolling volume stats and latest close prices (last 20 candles)
             stats = await MarketRepo.get_rolling_stats(session, ticker)
+            close_prices = await MarketRepo.get_recent_closes(session, ticker, limit=20)
 
             # Fetch just the most recent candle
             candles, _ = await MarketRepo.get_candles(session, ticker, hours=24, limit=1)
@@ -57,39 +62,64 @@ async def _detect(ticker: str) -> str | None:
                 return None
 
             latest = candles[0]
-            result = run_detection(int(latest.volume), stats)
+            result = run_combined_detection(
+                current_volume=int(latest.volume),
+                current_close=float(latest.close),
+                volume_stats=stats,
+                close_prices=close_prices,
+            )
 
             if not result.is_anomaly:
                 logger.debug(
-                    "No anomaly for %s (zscore=%.2f, count=%d)",
+                    "No anomaly for %s (zscore=%s, iqr_flag=%s, count=%d)",
                     ticker,
-                    result.zscore or 0.0,
+                    f"{result.zscore:.2f}" if result.zscore is not None else "N/A",
+                    result.iqr_flag,
                     stats.count,
                 )
                 return None
 
-            # Severity is guaranteed non-None when is_anomaly is True
-            anomaly = await AnomalyRepo.create(
-                session,
-                {
-                    "id": uuid.uuid4(),
-                    "detected_at": datetime.now(tz=timezone.utc),
-                    "candle_time": latest.time,
-                    "ticker": ticker,
-                    "type": AnomalyType.volume_spike,
-                    "severity": Severity[result.severity],  # type: ignore[index]
-                    "zscore": result.zscore,
-                    "iqr_flag": False,
-                    "report_status": ReportStatus.pending,
-                },
+            # Determine anomaly type:
+            # If Z-score fired → volume_spike (even if IQR also fired).
+            # If IQR-only (no Z-score) → price_swing.
+            anomaly_type = (
+                AnomalyType.price_swing
+                if result.iqr_flag and result.zscore is None
+                else AnomalyType.volume_spike
             )
-            await session.commit()
+
+            try:
+                anomaly = await AnomalyRepo.create(
+                    session,
+                    {
+                        "id": uuid.uuid4(),
+                        "detected_at": datetime.now(tz=timezone.utc),
+                        "candle_time": latest.time,
+                        "ticker": ticker,
+                        "type": anomaly_type,
+                        "severity": Severity[result.severity],  # type: ignore[index]
+                        "zscore": result.zscore,
+                        "iqr_flag": result.iqr_flag,
+                        "report_status": ReportStatus.pending,
+                    },
+                )
+                await session.commit()
+            except IntegrityError:
+                await session.rollback()
+                logger.info(
+                    "Duplicate anomaly skipped for %s candle_time=%s (unique constraint)",
+                    ticker,
+                    latest.time,
+                )
+                return None
 
             logger.info(
-                "Anomaly detected for %s: severity=%s zscore=%.2f id=%s",
+                "Anomaly detected for %s: type=%s severity=%s zscore=%s iqr=%s id=%s",
                 ticker,
+                anomaly_type.value,
                 result.severity,
-                result.zscore or 0.0,
+                f"{result.zscore:.2f}" if result.zscore is not None else "N/A",
+                result.iqr_flag,
                 anomaly.id,
             )
             return str(anomaly.id)

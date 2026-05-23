@@ -2,11 +2,10 @@
  * AnomalyCard — clickable card for a single detected anomaly.
  *
  * Clicking opens the ReportDrawer for this anomaly (via Zustand).
- * The card shows: ticker, severity, Z-score, anomaly type, relative time,
- * and a report status indicator.
+ * Shows: ticker, severity, anomaly type, Z-score, IQR flag (V2), time, report status.
  */
 
-import { Activity, FileText, Clock } from "lucide-react"
+import { Activity, FileText, Clock, TrendingUp } from "lucide-react"
 import { SeverityBadge } from "@/components/SeverityBadge"
 import { useUIStore } from "@/app/store"
 import { cn, timeAgo, round } from "@/lib/utils"
@@ -51,18 +50,27 @@ export function AnomalyCard({ anomaly }: AnomalyCardProps) {
         </span>
       </div>
 
-      {/* Middle row: Z-score */}
-      <div className="flex items-center gap-2 mb-2">
-        <Activity size={13} className="text-accent opacity-70" />
-        <span className="text-xs text-muted">Z-score</span>
-        <span
-          className={cn(
-            "font-mono text-sm font-semibold",
-            anomaly.severity === "HIGH" ? "text-severity-high" : "text-severity-medium",
-          )}
-        >
-          {anomaly.zscore !== null ? `+${round(anomaly.zscore, 2)}σ` : "—"}
-        </span>
+      {/* Middle row: Z-score + optional IQR flag */}
+      <div className="flex items-center gap-4 mb-2">
+        <div className="flex items-center gap-2">
+          <Activity size={13} className="text-accent opacity-70" />
+          <span className="text-xs text-muted">Z-score</span>
+          <span
+            className={cn(
+              "font-mono text-sm font-semibold",
+              anomaly.severity === "HIGH" ? "text-severity-high" : "text-severity-medium",
+            )}
+          >
+            {anomaly.zscore !== null ? `+${round(anomaly.zscore, 2)}σ` : "—"}
+          </span>
+        </div>
+
+        {anomaly.iqr_flag && (
+          <div className="flex items-center gap-1">
+            <TrendingUp size={12} className="text-amber-400" />
+            <span className="text-[11px] text-amber-400 font-mono">price swing</span>
+          </div>
+        )}
       </div>
 
       {/* Bottom row: time + report status */}

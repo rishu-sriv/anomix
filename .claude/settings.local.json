@@ -50,7 +50,9 @@
       "Bash(open -a Docker)",
       "Bash(docker info:*)",
       "Bash(docker port:*)",
-      "Bash(pip index:*)"
+      "Bash(pip index:*)",
+      "Bash(npx tsc:*)",
+      "Bash(./node_modules/.bin/tsc --noEmit)"
     ]
   }
 }
