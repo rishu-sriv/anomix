@@ -368,3 +368,49 @@ async def test_stream_report_tokens_yields_nothing_for_empty_stream():
             tokens = [t async for t in stream_report_tokens(_make_anomaly(), [], _make_stats())]
 
     assert tokens == []
+
+
+# ── Langfuse integration — mock path tracing ──────────────────────────────────
+
+
+def test_mock_report_returns_valid_schema():
+    """
+    Mock path must return a fully-populated ReportSchema with all fields set.
+    tokens_used must be 0, latency_ms must be non-negative, reasons must have
+    exactly 3 items, and confidence must be in [0.0, 1.0].
+    """
+    from app.services import reporter as reporter_module
+    from app.schemas.report import ReportSchema
+
+    anomaly = _make_anomaly()
+
+    with patch.object(reporter_module.settings, "use_mock_reports", True):
+        result = reporter_module.generate_report(anomaly, [], _make_stats())
+
+    assert isinstance(result, ReportSchema)
+    assert isinstance(result.id, uuid.UUID)
+    assert result.anomaly_id == anomaly.id
+    assert isinstance(result.summary, str) and len(result.summary) > 0
+    assert isinstance(result.reasons, list)
+    assert len(result.reasons) == 3
+    assert all(isinstance(r, str) and len(r) > 0 for r in result.reasons)
+    assert result.risk_level in ("High", "Medium", "Low")
+    assert 0.0 <= result.confidence <= 1.0
+    assert result.tokens_used == 0
+    assert result.latency_ms >= 0
+    assert isinstance(result.created_at, datetime)
+
+
+def test_mock_report_does_not_call_claude():
+    """
+    Mock path must never instantiate or invoke the Anthropic client.
+    Langfuse tracing is allowed (and expected) but Claude must not be called.
+    """
+    from app.services import reporter as reporter_module
+
+    anomaly = _make_anomaly()
+
+    with patch.object(reporter_module.settings, "use_mock_reports", True):
+        with patch("app.services.reporter.anthropic.Anthropic") as mock_cls:
+            reporter_module.generate_report(anomaly, [], _make_stats())
+            mock_cls.assert_not_called()
