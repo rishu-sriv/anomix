@@ -17,7 +17,7 @@ celery==5.3.6
 redis==5.0.4
 
 # Market data
-yfinance==0.2.38
+yfinance==0.2.54
 pandas==2.2.2
 
 # AI

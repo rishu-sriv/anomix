@@ -52,7 +52,11 @@
       "Bash(docker port:*)",
       "Bash(pip index:*)",
       "Bash(npx tsc:*)",
-      "Bash(./node_modules/.bin/tsc --noEmit)"
+      "Bash(./node_modules/.bin/tsc --noEmit)",
+      "Bash(grep:*)",
+      "Bash(curl -s http://localhost:8000/api/v1/anomalies)",
+      "Bash(curl -s \"http://localhost:8000/api/v1/anomalies?hours=8760\")",
+      "Bash(curl -s \"http://localhost:8000/api/v1/anomalies?hours=168\")"
     ]
   }
 }

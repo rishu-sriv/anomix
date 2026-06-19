@@ -2,9 +2,15 @@
 Report generation service — pure functions, zero database calls.
 
 V1: USE_MOCK_REPORTS=true  → generate_report() returns a hardcoded mock immediately.
-V2: USE_MOCK_REPORTS=false → calls the Claude API with 2-attempt JSON parse retry
-                             and optional Langfuse tracing when real credentials exist.
-    stream_report_tokens() → async generator for the SSE /stream endpoint.
+                             A Langfuse trace is still created so the dashboard shows
+                             the system working before real Claude calls are enabled.
+V2: USE_MOCK_REPORTS=false → calls the Claude API with 2-attempt JSON parse retry.
+                             Every call is traced in Langfuse (real client or noop).
+
+Langfuse is always accessed via get_langfuse() from app.core.langfuse_client.
+When credentials are stubs/missing, get_langfuse() returns a _NoopClient whose
+methods accept the same arguments but do nothing — so this module never branches
+on "is tracing active?".
 """
 
 from __future__ import annotations
@@ -15,36 +21,17 @@ import time
 import uuid
 from collections.abc import AsyncGenerator
 from datetime import datetime, timezone
+from typing import Any
 
 import anthropic
 
 from app.config import settings
+from app.core.langfuse_client import get_langfuse
 from app.models.anomaly import Anomaly
 from app.repositories.market_repo import RollingStats
 from app.schemas.report import ReportSchema
 
 logger = logging.getLogger(__name__)
-
-# ── Langfuse — only activated when real (non-stub) credentials are present ────
-# This prevents Langfuse from being initialised in test environments (stub keys)
-# and avoids network calls / auth errors during CI.
-
-_LANGFUSE_ACTIVE = (
-    settings.langfuse_public_key not in ("pk-lf-stub", "")
-    and settings.langfuse_secret_key not in ("sk-lf-stub", "")
-)
-
-_lf_context = None  # module-level reference; set below when active
-
-if _LANGFUSE_ACTIVE:
-    try:
-        from langfuse.decorators import (  # type: ignore[import]
-            langfuse_context as _lf_context,
-            observe as _lf_observe,
-        )
-    except Exception as _lf_import_err:
-        logger.warning("Langfuse import failed: %s — tracing disabled", _lf_import_err)
-        _LANGFUSE_ACTIVE = False
 
 
 # ── Mock report content (V1 / USE_MOCK_REPORTS=true) ─────────────────────────
@@ -174,10 +161,14 @@ def _call_claude_with_retry(
     prompt: str,
     anomaly: Anomaly,
     start: float,
+    generation: Any | None = None,
 ) -> ReportSchema:
     """
     Call Claude and parse the response JSON.  Up to 2 attempts.
     Attempt 2 uses a stricter system prompt that forbids any non-JSON output.
+
+    generation — optional Langfuse generation object (real or noop).
+                 When provided, per-attempt metadata is recorded on it.
 
     Raises RuntimeError if both attempts fail to produce parseable JSON.
     """
@@ -197,6 +188,16 @@ def _call_claude_with_retry(
 
             report = _parse_claude_json(raw, anomaly, start, total_tokens)
 
+            if generation is not None:
+                generation.update(
+                    metadata={
+                        "attempt_number": attempt,
+                        "tokens_used": total_tokens,
+                        "latency_ms": report.latency_ms,
+                        "parse_success": True,
+                    }
+                )
+
             logger.info(
                 "Report generated for anomaly %s (attempt=%d tokens=%d latency=%dms)",
                 anomaly.id,
@@ -207,6 +208,16 @@ def _call_claude_with_retry(
             return report
 
         except (json.JSONDecodeError, ValueError, KeyError) as exc:
+            if generation is not None:
+                err_meta: dict[str, Any] = {
+                    "attempt_number": attempt,
+                    "parse_success": False,
+                    "error": f"json_parse_failed_attempt_{attempt}",
+                }
+                if attempt >= len(systems):
+                    err_meta["failed"] = True
+                generation.update(metadata=err_meta)
+
             if attempt < len(systems):
                 logger.warning(
                     "Parse attempt %d failed for anomaly %s: %s — retrying with stricter prompt",
@@ -240,56 +251,101 @@ def generate_report(
     """
     Generate a report for the given anomaly.
 
-    USE_MOCK_REPORTS=true  → returns a hardcoded mock immediately (V1).
-    USE_MOCK_REPORTS=false → calls the Claude API; traces via Langfuse when configured (V2).
+    USE_MOCK_REPORTS=true  → returns a hardcoded mock (V1).
+    USE_MOCK_REPORTS=false → calls the Claude API (V2).
 
-    This function is synchronous and is called from the Celery report task via asyncio.run().
+    Both paths create a Langfuse trace so the dashboard reflects system
+    activity during V1 and automatically captures real Claude calls in V2.
+    get_langfuse() returns a NoopClient when credentials are stubs, so
+    this function never needs to check whether tracing is active.
+
+    Synchronous — called from the Celery report task via asyncio.run().
     Zero database calls — all inputs are passed by the caller.
     """
     start = time.monotonic()
+    lf = get_langfuse()
 
-    # ── Mock path ─────────────────────────────────────────────────────────────
-    if settings.use_mock_reports:
-        return ReportSchema(
-            id=uuid.uuid4(),
-            anomaly_id=anomaly.id,
-            summary=_MOCK_SUMMARY,
-            reasons=list(_MOCK_REASONS),
-            risk_level=_MOCK_RISK_LEVEL,
-            confidence=_MOCK_CONFIDENCE,
-            tokens_used=0,
-            latency_ms=int((time.monotonic() - start) * 1000),
-            created_at=datetime.now(tz=timezone.utc),
+    trace = lf.trace(
+        name="generate_anomaly_report",
+        input={
+            "ticker": anomaly.ticker,
+            "severity": anomaly.severity.value,
+            "zscore": anomaly.zscore,
+            "candle_time": (
+                anomaly.candle_time.isoformat() if anomaly.candle_time else None
+            ),
+        },
+        metadata={
+            "mock": settings.use_mock_reports,
+            "use_mock_reports": settings.use_mock_reports,
+            "anomaly_id": str(anomaly.id),
+            "anomaly_type": anomaly.type.value,
+        },
+    )
+
+    try:
+        # ── Mock path ─────────────────────────────────────────────────────────
+        if settings.use_mock_reports:
+            report = ReportSchema(
+                id=uuid.uuid4(),
+                anomaly_id=anomaly.id,
+                summary=_MOCK_SUMMARY,
+                reasons=list(_MOCK_REASONS),
+                risk_level=_MOCK_RISK_LEVEL,
+                confidence=_MOCK_CONFIDENCE,
+                tokens_used=0,
+                latency_ms=int((time.monotonic() - start) * 1000),
+                created_at=datetime.now(tz=timezone.utc),
+            )
+            trace.update(
+                output={
+                    "summary": report.summary,
+                    "risk_level": report.risk_level,
+                    "confidence": report.confidence,
+                },
+                metadata={
+                    "mock": True,
+                    "attempt_number": 1,
+                    "use_mock_reports": True,
+                    "tokens_used": 0,
+                    "latency_ms": report.latency_ms,
+                    "parse_success": True,
+                },
+            )
+            return report
+
+        # ── Real path — Claude API + per-attempt generation tracing ───────────
+        prompt = _build_prompt(anomaly, candles, stats)
+        generation = trace.generation(
+            name="claude_report_generation",
+            model=_MODEL,
+            input=prompt,
         )
 
-    # ── Real path — update Langfuse observation metadata if tracing is active ─
-    if _LANGFUSE_ACTIVE and _lf_context is not None:
-        try:
-            _lf_context.update_current_observation(
-                metadata={
-                    "ticker": anomaly.ticker,
-                    "severity": anomaly.severity.value,
-                    "zscore": anomaly.zscore,
-                    "anomaly_type": anomaly.type.value,
-                    "anomaly_id": str(anomaly.id),
-                }
-            )
-        except Exception:
-            pass  # Never crash because of an observability call
+        client = anthropic.Anthropic(api_key=settings.anthropic_api_key)
+        report = _call_claude_with_retry(client, prompt, anomaly, start, generation=generation)
 
-    client = anthropic.Anthropic(api_key=settings.anthropic_api_key)
-    prompt = _build_prompt(anomaly, candles, stats)
-    return _call_claude_with_retry(client, prompt, anomaly, start)
+        trace.update(
+            output={
+                "summary": report.summary,
+                "risk_level": report.risk_level,
+                "confidence": report.confidence,
+            },
+            metadata={
+                "mock": False,
+                "use_mock_reports": False,
+                "tokens_used": report.tokens_used,
+                "latency_ms": report.latency_ms,
+            },
+        )
+        return report
 
+    except Exception:
+        trace.update(level="ERROR")
+        raise
 
-# Apply Langfuse @observe decorator only when real credentials are present.
-# When _LANGFUSE_ACTIVE=False (stub keys / test environment) the function
-# runs undecorated, which is faster and avoids network calls.
-if _LANGFUSE_ACTIVE:
-    try:
-        generate_report = _lf_observe(name="generate_report")(generate_report)  # type: ignore[misc]
-    except Exception as _dec_err:
-        logger.warning("Failed to apply Langfuse decorator: %s", _dec_err)
+    finally:
+        lf.flush()
 
 
 async def stream_report_tokens(
